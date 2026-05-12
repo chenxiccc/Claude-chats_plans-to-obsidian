@@ -3,8 +3,8 @@
 Claude Code 会话记录 → Obsidian 自动归档
 SessionEnd hook：每次会话结束时，将完整对话转为 Markdown 写入 Obsidian vault。
 
-TRANSCRIPTS_DIR 下的每个项目子目录映射到 OBSIDIAN_DIR 下的同名子目录，
-一一对应组织历史对话。
+TRANSCRIPTS_DIR 下的每个项目子目录映射到 OBSIDIAN_DIR 下的子目录，
+文件夹名由 JSONL 中的 cwd 字段派生：取最后一级项目名，冲突时逐级追加父目录。
 """
 
 import json
@@ -34,6 +34,42 @@ def find_latest_transcript():
                 latest_mtime = mtime
                 latest = f
     return latest
+
+
+def get_cwd_from_jsonl(jsonl_path: Path) -> str | None:
+    """从 JSONL 文件中提取工作目录（cwd） / Extract working directory from JSONL file"""
+    try:
+        with open(jsonl_path) as f:
+            for i, line in enumerate(f):
+                if i >= 100:  # 前 100 行内必定有 user 消息 / user message always within first 100 lines
+                    break
+                try:
+                    d = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") == "user" and d.get("userType") == "external":
+                    cwd = d.get("cwd")
+                    if cwd:
+                        return cwd
+                    return None
+    except OSError:
+        return None
+    return None
+
+
+def resolve_folder_name(cwd: str, used_names: set[str]) -> str:
+    """根据 cwd 生成唯一文件夹名，冲突时逐级追加父目录 / Generate unique folder name from cwd, append parent dirs on conflict"""
+    parts = [p for p in cwd.split("/") if p]
+    parts.reverse()  # [项目名, 父级, 祖父级, ...] / [project, parent, grandparent, ...]
+
+    name = parts[0]
+    idx = 1
+    while name in used_names and idx < len(parts):
+        name = f"{name}-{parts[idx]}"
+        idx += 1
+
+    used_names.add(name)
+    return name
 
 
 # VS Code 会话标签缓存（首次调用时构建）
@@ -410,9 +446,10 @@ def main():
     scan_all = "--scan-all" in sys.argv
 
     if scan_all:
-        # 扫描所有项目子目录的所有 JSONL 文件
+        # 扫描所有项目子目录的所有 JSONL 文件 / Scan all JSONL files in all project subdirectories
         processed = 0
         total_jsonl = 0
+        used_names: set[str] = set()
         for subdir in sorted(TRANSCRIPTS_DIR.iterdir()):
             if not subdir.is_dir():
                 continue
@@ -420,7 +457,10 @@ def main():
             if not jsonl_files:
                 continue
             total_jsonl += len(jsonl_files)
-            output_subdir = OBSIDIAN_DIR / subdir.name
+            # 从该子目录下任意 JSONL 获取 cwd，生成新文件夹名 / Get cwd from any JSONL in subdir, generate new folder name
+            cwd = get_cwd_from_jsonl(jsonl_files[0])
+            folder_name = resolve_folder_name(cwd, used_names) if cwd else subdir.name
+            output_subdir = OBSIDIAN_DIR / folder_name
             for transcript in jsonl_files:
                 result = process_one(transcript, output_subdir)
                 if result:
@@ -428,12 +468,18 @@ def main():
                     processed += 1
         print(f"扫描完成: {total_jsonl} 个会话, 新归档 {processed} 个", file=sys.stderr)
     else:
-        # 只处理最新的一个（跨所有子目录找最近修改的 JSONL）
+        # 只处理最新的一个（跨所有子目录找最近修改的 JSONL） / Process only the latest one
         transcript = find_latest_transcript()
         if not transcript:
             sys.exit(0)
-        # 根据 JSONL 所在子目录确定输出子目录
-        output_subdir = OBSIDIAN_DIR / transcript.parent.name
+        # 根据 cwd 生成新文件夹名 / Generate new folder name from cwd
+        cwd = get_cwd_from_jsonl(transcript)
+        if cwd:
+            existing = {d.name for d in OBSIDIAN_DIR.iterdir() if d.is_dir()}
+            folder_name = resolve_folder_name(cwd, existing)
+        else:
+            folder_name = transcript.parent.name
+        output_subdir = OBSIDIAN_DIR / folder_name
         result = process_one(transcript, output_subdir)
         if result:
             print(f"Session saved to Obsidian: {result}", file=sys.stderr)

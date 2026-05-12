@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 架构要点
 
 - **双运行模式**：默认找最新 JSONL 处理（SessionEnd hook），`--scan-all` 遍历所有子目录（SessionStart hook）
-- **多项目目录映射**：`TRANSCRIPTS_DIR`（父目录）下每个子目录 → `OBSIDIAN_DIR` 下同名子目录
+- **多项目目录映射**：`TRANSCRIPTS_DIR`（父目录）下每个子目录 → `OBSIDIAN_DIR` 下由 cwd 派生的子目录。`get_cwd_from_jsonl()` 从 JSONL 的 `cwd` 字段提取工作目录，`resolve_folder_name()` 取最后一级路径组件作为文件夹名，同名冲突时向后追加父目录直至唯一
 - **标题提取**：`extract_topic()` 始终取首条用户消息，按 East Asian Width 截断（CJK/全角计 2，ASCII 计 1，累计 ≤ 40），去 Markdown 格式符和路径不安全字符
 - **增量更新**：仅 mtime 对比（JSONL vs MD），无复杂检测逻辑；mapping `.session_mapping.json` 存储 `{stem: filename}` 简单字符串
 - **标题清洗**：`extract_topic()` 去掉 `# * _ ` ~ > [ ] ! | \ / : ? " < >` 和首尾空格
