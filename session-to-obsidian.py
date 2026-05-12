@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import os
 import re
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -220,17 +221,8 @@ def parse_transcript(filepath):
     return messages, session_id, first_ts, last_ts
 
 
-def extract_topic(messages, session_id=None):
-    """提取会话主题：优先 VS Code 重命名，回退第一条用户消息（前20字，去格式符）"""
-    # 优先：VS Code 重命名的自定义标题（也需清洗非法字符）
-    if session_id:
-        name = find_session_name(session_id)
-        if name:
-            name = re.sub(r'[/\\:*?"<>|]', '', name).strip()
-            if name:
-                return name
-
-    # 回退：第一条用户消息
+def extract_topic(messages):
+    """提取会话主题：取首条用户消息，按 East Asian Width 截断至 40 单位宽度"""
     for m in messages:
         if m["role"] == "user":
             text = m["text"]
@@ -242,9 +234,16 @@ def extract_topic(messages, session_id=None):
             text = text.strip()
             # 4. 去掉路径不安全字符
             text = re.sub(r'[/\\:*?"<>|]', '', text)
-            # 5. 截取前 20 字
-            if len(text) > 20:
-                text = text[:20]
+            # 5. East Asian Width 截断：CJK/全角计 2，ASCII 计 1，累计 ≤ 40 截断
+            width = 0
+            result = []
+            for ch in text:
+                w = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+                if width + w > 40:
+                    break
+                result.append(ch)
+                width += w
+            text = ''.join(result)
             return text if text else "未命名会话"
     return "未命名会话"
 
@@ -278,7 +277,7 @@ def escape_obsidian_tags(text):
     return re.sub(r'(^|[\s\W])#(?=[\w一-鿿])', r'\1\\#', text)
 
 
-def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic):
+def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, label=None):
     """生成 Markdown 文档（含 frontmatter）"""
     user_count = sum(1 for m in messages if m["role"] == "user")
     assistant_count = sum(1 for m in messages if m["role"] == "assistant")
@@ -291,6 +290,8 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic):
     lines.append("---")
     lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
     lines.append(f"updated: {format_frontmatter_datetime(last_ts)}")
+    if label:
+        lines.append(f"label: {label}")
     lines.append("---")
     lines.append("")
     lines.append(f"# {topic}")
@@ -348,36 +349,29 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic):
     return "\n".join(lines)
 
 
-def find_existing_output(stem: str, output_subdir: Path) -> tuple[Path | None, str | None]:
-    """根据 JSONL stem 找到已存在的输出文件和旧 topic。
-    返回 (Path, old_topic)，不存在则返回 (None, None)。
-    兼容旧 mapping 格式（字符串值）和新格式（dict 含 filename + topic）。
-    """
+def find_existing_output(stem: str, output_subdir: Path) -> Path | None:
+    """根据 JSONL stem 找到已存在的输出文件，不存在则返回 None"""
     mapping_file = output_subdir / ".session_mapping.json"
     if not mapping_file.exists():
-        return None, None
+        return None
     try:
         mapping = json.loads(mapping_file.read_text())
         entry = mapping.get(stem)
         if entry is None:
-            return None, None
-        # 向后兼容旧格式：字符串值
-        if isinstance(entry, str):
-            p = output_subdir / entry
-            return (p, None) if p.exists() else (None, None)
-        # 新格式：dict 含 filename + topic
+            return None
+        # 向后兼容旧 dict 格式（含 filename + topic），迁移后自动转为字符串
         if isinstance(entry, dict):
             filename = entry.get("filename", "")
-            old_topic = entry.get("topic")
             p = output_subdir / filename
-            return (p, old_topic) if p.exists() else (None, old_topic)
-        return None, None
+            return p if p.exists() else None
+        p = output_subdir / entry
+        return p if p.exists() else None
     except (json.JSONDecodeError, OSError):
-        return None, None
+        return None
 
 
-def save_mapping(stem: str, filename: str, output_subdir: Path, topic: str) -> None:
-    """记录 JSONL stem → {filename, topic} 的映射（每个项目子目录独立维护）"""
+def save_mapping(stem: str, filename: str, output_subdir: Path) -> None:
+    """记录 JSONL stem → filename 的映射（每个项目子目录独立维护）"""
     mapping_file = output_subdir / ".session_mapping.json"
     mapping = {}
     if mapping_file.exists():
@@ -385,7 +379,7 @@ def save_mapping(stem: str, filename: str, output_subdir: Path, topic: str) -> N
             mapping = json.loads(mapping_file.read_text())
         except (json.JSONDecodeError, OSError):
             pass
-    mapping[stem] = {"filename": filename, "topic": topic}
+    mapping[stem] = filename
     mapping_file.write_text(json.dumps(mapping, ensure_ascii=False, indent=2))
 
 
@@ -397,22 +391,14 @@ def process_one(transcript: Path, output_subdir: Path) -> str | None:
     if not messages or len(messages) < 2:
         return None
 
-    # 计算当前 topic（优先 VS Code name，回退首条用户消息）
-    topic = extract_topic(messages, session_id)
+    # 计算当前 topic（首条用户消息）
+    topic = extract_topic(messages)
 
-    # 查找已有输出和旧 topic
-    existing, old_topic = find_existing_output(transcript.stem, output_subdir)
+    # 查找已有输出
+    existing = find_existing_output(transcript.stem, output_subdir)
 
-    # 判断是否需要重新生成
-    need_regenerate = False
-    if existing is None:
-        need_regenerate = True
-    elif existing.stat().st_mtime < transcript.stat().st_mtime:
-        need_regenerate = True  # JSONL 比 MD 新，内容变了
-    elif old_topic is not None and topic != old_topic:
-        need_regenerate = True  # 标题变了（仅新格式 mapping 可检测）
-
-    if not need_regenerate:
+    # mtime 增量检测：输出文件不比 JSONL 旧则跳过
+    if existing and existing.stat().st_mtime >= transcript.stat().st_mtime:
         return None
 
     # 生成文件名（纯主题，同名自动加 _2 _3 去重）
@@ -432,9 +418,12 @@ def process_one(transcript: Path, output_subdir: Path) -> str | None:
     if existing and existing != output_path:
         existing.unlink(missing_ok=True)
 
-    md = generate_markdown(messages, session_id, first_ts, last_ts, transcript, topic)
+    # 获取 VS Code 标签（仅写入 frontmatter 元数据，不做标题）
+    label = find_session_name(session_id)
+
+    md = generate_markdown(messages, session_id, first_ts, last_ts, transcript, topic, label)
     output_path.write_text(md, encoding="utf-8")
-    save_mapping(transcript.stem, filename, output_subdir, topic)
+    save_mapping(transcript.stem, filename, output_subdir)
 
     is_update = existing is not None
     subdir_name = output_subdir.name
