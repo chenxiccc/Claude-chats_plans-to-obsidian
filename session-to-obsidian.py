@@ -137,7 +137,8 @@ def parse_transcript(filepath):
                 # 过滤 Claude Code 系统注入的 XML 标签
                 text = re.sub(
                     r'<(system-reminder|local-command-caveat|command-name|command-message'
-                    r'|command-args|local-command-stdout|task-notification)>[\s\S]*?</\1>',
+                    r'|command-args|local-command-stdout|task-notification'
+                    r'|ide_opened_file|ide_selection|ide_diagnostics)>[\s\S]*?</\1>',
                     '', text)
                 text = text.strip()
 
