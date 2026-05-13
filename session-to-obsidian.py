@@ -72,6 +72,25 @@ def resolve_folder_name(cwd: str, used_names: set[str]) -> str:
     return name
 
 
+def load_cwd_mapping() -> dict[str, str]:
+    """读取 cwd → folder_name 映射 / Load cwd → folder_name mapping"""
+    mapping_file = OBSIDIAN_DIR / ".cwd_mapping.json"
+    if not mapping_file.exists():
+        return {}
+    try:
+        # 文件存储为 {folder_name: cwd}，反转为 {cwd: folder_name} 便于查询 / File stores {folder_name: cwd}, invert for O(1) lookup
+        raw = json.loads(mapping_file.read_text())
+        return {cwd: name for name, cwd in raw.items()}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
+    """全量写入 {folder_name: cwd} 映射 / Full rewrite of folder_name → cwd mapping"""
+    mapping_file = OBSIDIAN_DIR / ".cwd_mapping.json"
+    mapping_file.write_text(json.dumps(name_to_cwd, ensure_ascii=False, indent=2))
+
+
 # VS Code 会话标签缓存（首次调用时构建）
 _vscode_labels: dict[str, str] | None = None
 
@@ -450,6 +469,7 @@ def main():
         processed = 0
         total_jsonl = 0
         used_names: set[str] = set()
+        name_to_cwd: dict[str, str] = {}  # {folder_name: cwd} / folder name → cwd mapping
         for subdir in sorted(TRANSCRIPTS_DIR.iterdir()):
             if not subdir.is_dir():
                 continue
@@ -461,11 +481,15 @@ def main():
             cwd = get_cwd_from_jsonl(jsonl_files[0])
             folder_name = resolve_folder_name(cwd, used_names) if cwd else subdir.name
             output_subdir = OBSIDIAN_DIR / folder_name
+            if cwd:
+                name_to_cwd[folder_name] = cwd
             for transcript in jsonl_files:
                 result = process_one(transcript, output_subdir)
                 if result:
                     print(f"  归档: {result}", file=sys.stderr)
                     processed += 1
+        # 持久化 cwd → folder_name 映射，供增量 SessionEnd 查询 / Persist cwd → folder_name mapping for SessionEnd to query
+        save_cwd_mapping(name_to_cwd)
         print(f"扫描完成: {total_jsonl} 个会话, 新归档 {processed} 个", file=sys.stderr)
     else:
         # 只处理最新的一个（跨所有子目录找最近修改的 JSONL） / Process only the latest one
@@ -475,8 +499,18 @@ def main():
         # 根据 cwd 生成新文件夹名 / Generate new folder name from cwd
         cwd = get_cwd_from_jsonl(transcript)
         if cwd:
-            existing = {d.name for d in OBSIDIAN_DIR.iterdir() if d.is_dir()}
-            folder_name = resolve_folder_name(cwd, existing)
+            cwd_to_name = load_cwd_mapping()  # {cwd: folder_name} / cwd → folder name lookup
+            if cwd in cwd_to_name:
+                # 已有映射，直接复用 / Already mapped, reuse
+                folder_name = cwd_to_name[cwd]
+            else:
+                # 新 cwd，需解析冲突 / New cwd, resolve against existing
+                existing_names = set(cwd_to_name.values())
+                folder_name = resolve_folder_name(cwd, existing_names)
+                # 持久化新映射 / Persist new mapping
+                name_to_cwd = {v: k for k, v in cwd_to_name.items()}
+                name_to_cwd[folder_name] = cwd
+                save_cwd_mapping(name_to_cwd)
         else:
             folder_name = transcript.parent.name
         output_subdir = OBSIDIAN_DIR / folder_name
