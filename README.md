@@ -151,6 +151,7 @@ chmod +x ~/.claude/scripts/hooks/session-to-obsidian.py
 OBSIDIAN_DIR = Path.home() / "Obsidian" / "Project" / "claude" / "session"   # 改成你的 Obsidian vault 子目录
 TRANSCRIPTS_DIR = Path.home() / ".claude" / "projects"  # Claude Code 转录文件父目录
 CHINA_TZ = timezone(timedelta(hours=8))  # 改成你的时区
+REFERENCE_PLANS_IN_OBSIDIAN = 0  # 设为 1 则引用 Obsidian 中的计划文件（需先将 ~/.claude/plans 软链接到 vault）
 ```
 
 > `TRANSCRIPTS_DIR` 设为 `~/.claude/projects/`（父目录），脚本会自动遍历其下所有项目子目录，在 Obsidian 中创建同名子目录一一对应。
@@ -160,6 +161,7 @@ CHINA_TZ = timezone(timedelta(hours=8))  # 改成你的时区
 | `OBSIDIAN_DIR` | Markdown 输出根目录，脚本会自动在其下创建项目子目录 | 打开 Obsidian → 设置 → 查看 vault 路径，然后加一个子文件夹 |
 | `TRANSCRIPTS_DIR` | Claude Code 转录文件父目录，包含所有项目子目录 | 运行 `ls ~/.claude/projects/` 确认该目录存在 |
 | `CHINA_TZ` | 时间戳转换时区 | 改成你当地时区的 UTC 偏移 |
+| `REFERENCE_PLANS_IN_OBSIDIAN` | 设为 1 时，会话中涉及计划文件的操作（Read/Write/Edit 等）会生成为 `[[plan-name]]` wikilink 直接可见 | 需先将 `~/.claude/plans` 软链接到 vault 下（0 禁用，1 启用） |
 
 #### 第三步：配置 Claude Code Hook
 
@@ -458,6 +460,7 @@ Edit the config section at the top of `session-to-obsidian.py`:
 OBSIDIAN_DIR = Path.home() / "Obsidian" / "Project" / "claude" / "session"   # Your Obsidian vault subdirectory
 TRANSCRIPTS_DIR = Path.home() / ".claude" / "projects"  # Claude Code transcript parent directory
 CHINA_TZ = timezone(timedelta(hours=8))  # Your timezone
+REFERENCE_PLANS_IN_OBSIDIAN = 0  # Set to 1 to reference plan files in Obsidian (symlink ~/.claude/plans into vault first)
 ```
 
 > Set `TRANSCRIPTS_DIR` to `~/.claude/projects/` (parent). The script auto-traverses all project subdirectories and creates matching subdirectories in Obsidian.
@@ -467,6 +470,7 @@ CHINA_TZ = timezone(timedelta(hours=8))  # Your timezone
 | `OBSIDIAN_DIR` | Output root directory; project subdirectories are auto-created under it | Obsidian → Settings → vault path, then add a subfolder |
 | `TRANSCRIPTS_DIR` | Claude Code transcript parent directory, containing all project subdirectories | Run `ls ~/.claude/projects/` to confirm it exists |
 | `CHINA_TZ` | Timezone for timestamps | Change to your local UTC offset |
+| `REFERENCE_PLANS_IN_OBSIDIAN` | When set to 1, operations on plan files (Read/Write/Edit etc.) are shown as visible `[[plan-name]]` wikilinks | Requires symlinking `~/.claude/plans` into vault (0 disabled, 1 enabled) |
 
 #### Step 3: Configure Claude Code Hooks
 

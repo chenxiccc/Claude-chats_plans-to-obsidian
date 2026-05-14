@@ -259,9 +259,16 @@ def parse_transcript(filepath):
                         tool_name = c.get("name", "unknown")
                         tool_input = c.get("input", {})
                         # 简化工具调用记录 / Simplify tool call records
-                        if tool_name in ("Read", "Glob", "Grep"):
+                        if tool_name in ("Glob", "Grep"):
                             param = tool_input.get("file_path") or tool_input.get("pattern") or tool_input.get("path", "")
                             tools_used.append(f"`{tool_name}`: {param}")
+                        elif tool_name == "Read":
+                            fp = tool_input.get("file_path", "")
+                            tools_used.append(f"`Read`: {fp}")
+                            if REFERENCE_PLANS_IN_OBSIDIAN:
+                                wikilink = plan_path_to_wikilink(fp)
+                                if wikilink and wikilink not in plan_refs:
+                                    plan_refs.append(wikilink)
                         elif tool_name == "Bash":
                             cmd = tool_input.get("command", "")
                             if len(cmd) > 120:
@@ -347,6 +354,15 @@ def escape_obsidian_tags(text):
     return re.sub(r'(^|[\s\W])#(?=[\w一-鿿])', r'\1\\#', text)
 
 
+def sanitize_markdown_links(text: str) -> str:
+    """去掉 Markdown 链接格式避免 Obsidian 误渲染 / Strip markdown link syntax to avoid Obsidian misrendering"""
+    # [text](url) → text (url) — 纯文本保留路径 / plain text with path
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', text)
+    # 独立 [text] → 去掉方括号 / standalone [text] → remove brackets
+    text = re.sub(r'\[([^\]]+)\](?!\()', r'\1', text)
+    return text
+
+
 def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, label=None):
     """生成 Markdown 文档（含 frontmatter）"""
     user_count = sum(1 for m in messages if m["role"] == "user")
@@ -380,6 +396,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             lines.append("")
             # 用户消息原文
             text = escape_obsidian_tags(m["text"])
+            text = sanitize_markdown_links(text)
             if len(text) > 2000:
                 text = text[:2000] + "\n\n... (已截断)"
             lines.append(text)
@@ -407,6 +424,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
 
             # 回复内容
             text = escape_obsidian_tags(m["text"])
+            text = sanitize_markdown_links(text)
             if len(text) > 3000:
                 text = text[:3000] + "\n\n... (已截断)"
             if text:
