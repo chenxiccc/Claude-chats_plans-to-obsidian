@@ -106,9 +106,11 @@ _PLANS_DIR = str(Path.home() / ".claude" / "plans")
 
 def plan_path_to_wikilink(path: str) -> str | None:
     """将 .claude/plans/ 下的文件路径转为 Obsidian wikilink / Convert plan file path to Obsidian wikilink"""
-    if _PLANS_DIR not in path:
+    if not path.startswith(_PLANS_DIR):
         return None
-    name = Path(path).stem  # 文件名去掉 .md / filename without .md extension
+    name = path.rsplit("/", 1)[-1]  # 取文件名 / extract filename
+    if name.endswith(".md"):
+        name = name[:-3]
     return f"[[{name}]]" if name else None
 
 
@@ -267,15 +269,11 @@ def parse_transcript(filepath):
                             tools_used.append(f"`Bash`: `{cmd}`")
                         elif tool_name in ("Edit", "Write"):
                             fp = tool_input.get("file_path", "")
+                            tools_used.append(f"`{tool_name}`: {fp}")
                             if REFERENCE_PLANS_IN_OBSIDIAN:
                                 wikilink = plan_path_to_wikilink(fp)
                                 if wikilink and wikilink not in plan_refs:
                                     plan_refs.append(wikilink)
-                                    tools_used.append(f"`{tool_name}`: {fp}")
-                                elif not wikilink:
-                                    tools_used.append(f"`{tool_name}`: {fp}")
-                            else:
-                                tools_used.append(f"`{tool_name}`: {fp}")
                         elif tool_name.startswith("mcp__"):
                             short = tool_name.split("__")[-1]
                             tools_used.append(f"`{short}`")
@@ -284,7 +282,7 @@ def parse_transcript(filepath):
                     # skip thinking, tool_result etc.
 
                 text = "\n\n".join(parts)
-                if not text and not tools_used and not plan_refs:
+                if not text and not tools_used:
                     continue
 
                 msg = {"role": "assistant", "text": text, "timestamp": timestamp}
