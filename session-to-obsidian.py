@@ -101,17 +101,22 @@ def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
     mapping_file.write_text(json.dumps(name_to_cwd, ensure_ascii=False, indent=2))
 
 
-_PLANS_DIR = str(Path.home() / ".claude" / "plans")
+# 匹配 /.claude/plans/*.md 路径，兼容 Unix / Windows 分隔符 / Match /.claude/plans/*.md paths, cross-platform separators
+_PLAN_PATH_RE = re.compile(r'[/\\]\.claude[/\\]plans[/\\]([^\s)\]\*]+?)\.md')
 
 
-def plan_path_to_wikilink(path: str) -> str | None:
-    """将 .claude/plans/ 下的文件路径转为 Obsidian wikilink / Convert plan file path to Obsidian wikilink"""
-    if not path.startswith(_PLANS_DIR):
-        return None
-    name = path.rsplit("/", 1)[-1]  # 取文件名 / extract filename
-    if name.endswith(".md"):
-        name = name[:-3]
-    return f"[[{name}]]" if name else None
+def extract_plan_refs(text: str) -> list[str]:
+    """从文本中提取 .claude/plans/*.md 引用，返回去重 wikilink 列表 / Extract plan refs from text, return deduplicated wikilinks"""
+    if not REFERENCE_PLANS_IN_OBSIDIAN:
+        return []
+    names = _PLAN_PATH_RE.findall(text)
+    seen: set[str] = set()
+    refs: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            refs.append(f"[[{name}]]")
+    return refs
 
 
 # VS Code 会话标签缓存（首次调用时构建）
@@ -234,18 +239,17 @@ def parse_transcript(filepath):
                 if any(re.match(p, text) for p in skip_patterns):
                     continue
 
-                messages.append({
-                    "role": "user",
-                    "text": text,
-                    "timestamp": timestamp,
-                })
+                msg = {"role": "user", "text": text, "timestamp": timestamp}
+                plan_refs = extract_plan_refs(text)
+                if plan_refs:
+                    msg["plan_refs"] = plan_refs
+                messages.append(msg)
                 last_ts = timestamp
 
             elif msg_type == "assistant":
                 content_items = d["message"].get("content", [])
                 parts = []
                 tools_used = []
-                plan_refs = []
 
                 for c in content_items:
                     if not isinstance(c, dict):
@@ -265,10 +269,6 @@ def parse_transcript(filepath):
                         elif tool_name == "Read":
                             fp = tool_input.get("file_path", "")
                             tools_used.append(f"`Read`: {fp}")
-                            if REFERENCE_PLANS_IN_OBSIDIAN:
-                                wikilink = plan_path_to_wikilink(fp)
-                                if wikilink and wikilink not in plan_refs:
-                                    plan_refs.append(wikilink)
                         elif tool_name == "Bash":
                             cmd = tool_input.get("command", "")
                             if len(cmd) > 120:
@@ -277,10 +277,6 @@ def parse_transcript(filepath):
                         elif tool_name in ("Edit", "Write"):
                             fp = tool_input.get("file_path", "")
                             tools_used.append(f"`{tool_name}`: {fp}")
-                            if REFERENCE_PLANS_IN_OBSIDIAN:
-                                wikilink = plan_path_to_wikilink(fp)
-                                if wikilink and wikilink not in plan_refs:
-                                    plan_refs.append(wikilink)
                         elif tool_name.startswith("mcp__"):
                             short = tool_name.split("__")[-1]
                             tools_used.append(f"`{short}`")
@@ -292,6 +288,11 @@ def parse_transcript(filepath):
                 if not text and not tools_used:
                     continue
 
+                # 从文本和工具调用路径中提取计划文件引用 / Extract plan refs from text and tool paths
+                scan_text = text
+                if tools_used:
+                    scan_text += "\n" + "\n".join(tools_used)
+                plan_refs = extract_plan_refs(scan_text)
                 msg = {"role": "assistant", "text": text, "timestamp": timestamp}
                 if tools_used:
                     msg["tools"] = tools_used
@@ -367,6 +368,16 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     """生成 Markdown 文档（含 frontmatter）"""
     user_count = sum(1 for m in messages if m["role"] == "user")
     assistant_count = sum(1 for m in messages if m["role"] == "assistant")
+
+    # 收集整个会话涉及的计划文件（去重） / Collect session-wide plan refs (deduplicated)
+    session_plan_refs: list[str] = []
+    _seen_plans: set[str] = set()
+    for m in messages:
+        for ref in m.get("plan_refs", []):
+            if ref not in _seen_plans:
+                _seen_plans.add(ref)
+                session_plan_refs.append(ref)
+
     lines = []
     # YAML frontmatter
     lines.append("---")
@@ -374,6 +385,10 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
     if label:
         lines.append(f"label: {label}")
+    if session_plan_refs:
+        lines.append("plans:")
+        for ref in session_plan_refs:
+            lines.append(f'  - "{ref}"')
     lines.append("---")
     lines.append(f"> 时间：{format_datetime(first_ts)} ~ {format_datetime(last_ts)}")
     lines.append(f"> 轮数：用户 {user_count} 轮，Claude {assistant_count} 轮")
@@ -400,16 +415,22 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             if len(text) > 2000:
                 text = text[:2000] + "\n\n... (已截断)"
             lines.append(text)
+            if m.get("plan_refs"):
+                for ref in m["plan_refs"]:
+                    lines.append(f"> 📋 {ref}")
             lines.append("")
 
         elif m["role"] == "assistant":
             lines.append(f"**Claude** `{ts}`")
             lines.append("")
 
-            # 计划文件引用（可见，不折叠） / Plan file references (visible, not folded)
-            if m.get("plan_refs"):
-                for ref in m["plan_refs"]:
-                    lines.append(f"> 📋 {ref}")
+            # 回复内容 / Response text
+            text = escape_obsidian_tags(m["text"])
+            text = sanitize_markdown_links(text)
+            if len(text) > 3000:
+                text = text[:3000] + "\n\n... (已截断)"
+            if text:
+                lines.append(text)
                 lines.append("")
 
             # 工具调用（折叠） / Tool calls (folded)
@@ -422,14 +443,12 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
                 lines.append("</details>")
                 lines.append("")
 
-            # 回复内容
-            text = escape_obsidian_tags(m["text"])
-            text = sanitize_markdown_links(text)
-            if len(text) > 3000:
-                text = text[:3000] + "\n\n... (已截断)"
-            if text:
-                lines.append(text)
-            lines.append("")
+            # 计划文件引用（内容下方） / Plan file references (below content)
+            if m.get("plan_refs"):
+                for ref in m["plan_refs"]:
+                    lines.append(f"> 📋 {ref}")
+                lines.append("")
+
             lines.append("---")
             lines.append("")
 
