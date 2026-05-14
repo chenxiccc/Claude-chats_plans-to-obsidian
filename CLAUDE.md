@@ -11,6 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 纯 Python 标准库，无第三方依赖
 - 没有测试套件。验证方式：`python3 session-to-obsidian.py --scan-all`，检查 `OBSIDIAN_DIR` 下的输出
 - 配置变量在脚本顶部 `# ===== 配置 =====` 区域
+- `.gitignore` 已排除 `__pycache__/`、`*.pyc`、`app.js`
 
 ## Hook 部署
 
@@ -23,7 +24,7 @@ cp session-to-obsidian.py ~/.claude/scripts/hooks/session-to-obsidian.py
 ## 架构要点
 
 - **双运行模式**：默认找最新 JSONL 处理（SessionEnd hook），`--scan-all` 遍历所有子目录（SessionStart hook）
-- **多项目目录映射**：`TRANSCRIPTS_DIR`（父目录）下每个子目录 → `OBSIDIAN_DIR` 下由 cwd 派生的子目录。`get_cwd_from_jsonl()` 从 JSONL 的 `cwd` 字段提取工作目录，`resolve_folder_name()` 取最后一级路径组件作为文件夹名，同名冲突时向后追加父目录直至唯一
+- **多项目目录映射**：`TRANSCRIPTS_DIR`（父目录）下每个子目录 → `OBSIDIAN_DIR` 下由 cwd 派生的子目录。`get_cwd_from_jsonl()` 从 JSONL 的 `cwd` 字段提取工作目录，`resolve_folder_name()` 取最后一级路径组件作为文件夹名，同名冲突时向后追加父目录直至唯一。`.cwd_mapping.json` 持久化 `{folder_name: cwd}` 映射，`--scan-all` 全量写入，SessionEnd 先查映射复用已有文件夹，避免同名项目自我冲突递归命名
 - **标题提取**：`extract_topic()` 始终取首条用户消息，按 East Asian Width 截断（CJK/全角计 2，ASCII 计 1，累计 ≤ 40），去 Markdown 格式符和路径不安全字符
 - **增量更新**：仅 mtime 对比（JSONL vs MD），无复杂检测逻辑；mapping `.session_mapping.json` 存储 `{stem: filename}` 简单字符串
 - **标题清洗**：`extract_topic()` 去掉 `# * _ ` ~ > [ ] ! | \ / : ? " < >` 和首尾空格

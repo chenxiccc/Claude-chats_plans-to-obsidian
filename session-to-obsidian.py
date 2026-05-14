@@ -18,6 +18,16 @@ from pathlib import Path
 # ===== 配置 =====
 OBSIDIAN_DIR = Path.home() / "Obsidian" / "Project" / "claude" / "session"
 TRANSCRIPTS_DIR = Path.home() / ".claude" / "projects"
+
+# 是否在会话记录中引用 Obsidian 中的计划文件 / Reference plan files in Obsidian via wikilinks
+# 0 = 不引用，工具调用中对计划文件的 Write/Edit/Read 操作保持折叠在 <details> 中
+# 1 = 生成 [[filename]] wikilink 引用 Obsidian 中同名的计划文件（不折叠，直接可见）
+# 引用的前提：需先将 ~/.claude/plans 软链接到 Obsidian vault 下，操作方式：
+#   mkdir -p ~/Obsidian/Project/claude
+#   ln -s ~/.claude/plans ~/Obsidian/Project/claude/plans
+
+REFERENCE_PLANS_IN_OBSIDIAN = 1
+
 CHINA_TZ = timezone(timedelta(hours=8))
 
 
@@ -89,6 +99,17 @@ def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
     """全量写入 {folder_name: cwd} 映射 / Full rewrite of folder_name → cwd mapping"""
     mapping_file = OBSIDIAN_DIR / ".cwd_mapping.json"
     mapping_file.write_text(json.dumps(name_to_cwd, ensure_ascii=False, indent=2))
+
+
+_PLANS_DIR = str(Path.home() / ".claude" / "plans")
+
+
+def plan_path_to_wikilink(path: str) -> str | None:
+    """将 .claude/plans/ 下的文件路径转为 Obsidian wikilink / Convert plan file path to Obsidian wikilink"""
+    if _PLANS_DIR not in path:
+        return None
+    name = Path(path).stem  # 文件名去掉 .md / filename without .md extension
+    return f"[[{name}]]" if name else None
 
 
 # VS Code 会话标签缓存（首次调用时构建）
@@ -222,6 +243,7 @@ def parse_transcript(filepath):
                 content_items = d["message"].get("content", [])
                 parts = []
                 tools_used = []
+                plan_refs = []
 
                 for c in content_items:
                     if not isinstance(c, dict):
@@ -234,7 +256,7 @@ def parse_transcript(filepath):
                     elif ct == "tool_use":
                         tool_name = c.get("name", "unknown")
                         tool_input = c.get("input", {})
-                        # 简化工具调用记录
+                        # 简化工具调用记录 / Simplify tool call records
                         if tool_name in ("Read", "Glob", "Grep"):
                             param = tool_input.get("file_path") or tool_input.get("pattern") or tool_input.get("path", "")
                             tools_used.append(f"`{tool_name}`: {param}")
@@ -243,12 +265,17 @@ def parse_transcript(filepath):
                             if len(cmd) > 120:
                                 cmd = cmd[:120] + "..."
                             tools_used.append(f"`Bash`: `{cmd}`")
-                        elif tool_name == "Edit":
+                        elif tool_name in ("Edit", "Write"):
                             fp = tool_input.get("file_path", "")
-                            tools_used.append(f"`Edit`: {fp}")
-                        elif tool_name == "Write":
-                            fp = tool_input.get("file_path", "")
-                            tools_used.append(f"`Write`: {fp}")
+                            if REFERENCE_PLANS_IN_OBSIDIAN:
+                                wikilink = plan_path_to_wikilink(fp)
+                                if wikilink and wikilink not in plan_refs:
+                                    plan_refs.append(wikilink)
+                                    tools_used.append(f"`{tool_name}`: {fp}")
+                                elif not wikilink:
+                                    tools_used.append(f"`{tool_name}`: {fp}")
+                            else:
+                                tools_used.append(f"`{tool_name}`: {fp}")
                         elif tool_name.startswith("mcp__"):
                             short = tool_name.split("__")[-1]
                             tools_used.append(f"`{short}`")
@@ -257,12 +284,14 @@ def parse_transcript(filepath):
                     # skip thinking, tool_result etc.
 
                 text = "\n\n".join(parts)
-                if not text and not tools_used:
+                if not text and not tools_used and not plan_refs:
                     continue
 
                 msg = {"role": "assistant", "text": text, "timestamp": timestamp}
                 if tools_used:
                     msg["tools"] = tools_used
+                if plan_refs:
+                    msg["plan_refs"] = plan_refs
                 messages.append(msg)
                 last_ts = timestamp
 
@@ -362,7 +391,13 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             lines.append(f"**Claude** `{ts}`")
             lines.append("")
 
-            # 工具调用
+            # 计划文件引用（可见，不折叠） / Plan file references (visible, not folded)
+            if m.get("plan_refs"):
+                for ref in m["plan_refs"]:
+                    lines.append(f"> 📋 {ref}")
+                lines.append("")
+
+            # 工具调用（折叠） / Tool calls (folded)
             if m.get("tools"):
                 lines.append("<details><summary>工具调用</summary>")
                 lines.append("")
