@@ -373,7 +373,7 @@ def sanitize_markdown_links(text: str) -> str:
     return text
 
 
-def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, label=None):
+def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, cwd=None, label=None):
     """生成 Markdown 文档（含 frontmatter）"""
     user_count = sum(1 for m in messages if m["role"] == "user")
     assistant_count = sum(1 for m in messages if m["role"] == "assistant")
@@ -391,6 +391,9 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     # YAML frontmatter
     lines.append("---")
     lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
+    if cwd:
+        # YAML 单引号包裹，避免 Windows \ 被解析为转义字符 / YAML single-quote to prevent \ escape interpretation
+        lines.append(f"cwd: '{cwd}'")
     lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
     if label:
         lines.append(f"label: {label}")
@@ -403,7 +406,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     lines.append(f"> 轮数：用户 {user_count} 轮，Claude {assistant_count} 轮")
     lines.append(f"> 来源：`{filepath.name}`")
     if session_id:
-        lines.append(f"> Session：`{session_id[:12]}...`")
+        lines.append(f"> Session：`{session_id}`")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -493,7 +496,7 @@ def save_mapping(stem: str, filename: str, output_subdir: Path) -> None:
     mapping_file.write_text(json.dumps(mapping, ensure_ascii=False, indent=2))
 
 
-def process_one(transcript: Path, output_subdir: Path) -> str | None:
+def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -> str | None:
     """处理单个转录文件，返回生成的文件名，无变化则返回 None"""
     output_subdir.mkdir(parents=True, exist_ok=True)
 
@@ -528,7 +531,7 @@ def process_one(transcript: Path, output_subdir: Path) -> str | None:
     # 获取 VS Code 标签（仅写入 frontmatter 元数据，不做标题）
     label = find_session_name(session_id)
 
-    md = generate_markdown(messages, session_id, first_ts, last_ts, transcript, topic, label)
+    md = generate_markdown(messages, session_id, first_ts, last_ts, transcript, topic, cwd, label)
     output_path.write_text(md, encoding="utf-8")
     save_mapping(transcript.stem, filename, output_subdir)
 
@@ -563,7 +566,7 @@ def main():
             if cwd:
                 name_to_cwd[folder_name] = cwd
             for transcript in jsonl_files:
-                result = process_one(transcript, output_subdir)
+                result = process_one(transcript, output_subdir, cwd)
                 if result:
                     print(f"  归档: {result}", file=sys.stderr)
                     processed += 1
@@ -593,7 +596,7 @@ def main():
         else:
             folder_name = transcript.parent.name
         output_subdir = OBSIDIAN_DIR / folder_name
-        result = process_one(transcript, output_subdir)
+        result = process_one(transcript, output_subdir, cwd)
         if result:
             print(f"Session saved to Obsidian: {result}", file=sys.stderr)
 
