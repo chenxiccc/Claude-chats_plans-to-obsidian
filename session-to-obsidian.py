@@ -47,24 +47,25 @@ def find_latest_transcript():
     return latest
 
 
-def get_cwd_from_jsonl(jsonl_path: Path) -> str | None:
-    """从 JSONL 文件中提取工作目录（cwd） / Extract working directory from JSONL file"""
-    try:
-        with open(jsonl_path) as f:
-            for i, line in enumerate(f):
-                if i >= 100:  # 前 100 行内必定有 user 消息 / user message always within first 100 lines
-                    break
-                try:
-                    d = json.loads(line.strip())
-                except json.JSONDecodeError:
-                    continue
-                if d.get("type") == "user" and d.get("userType") == "external":
-                    cwd = d.get("cwd")
-                    if cwd:
-                        return cwd
-                    return None
-    except OSError:
-        return None
+def get_cwd_from_jsonl(*jsonl_paths: Path) -> str | None:
+    """从 JSONL 文件列表中提取工作目录（cwd），逐个尝试直到找到 / Try each JSONL in order until cwd is found"""
+    for jsonl_path in jsonl_paths:
+        try:
+            with open(jsonl_path) as f:
+                for i, line in enumerate(f):
+                    if i >= 100:  # 前 100 行内必定有 user 消息 / user message always within first 100 lines
+                        break
+                    try:
+                        d = json.loads(line.strip())
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("type") == "user" and d.get("userType") == "external":
+                        cwd = d.get("cwd")
+                        if cwd:
+                            return cwd
+                        break  # 有 user 消息但无 cwd，跳过此文件 / user message found but no cwd, try next file
+        except OSError:
+            continue
     return None
 
 
@@ -391,10 +392,10 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     # YAML frontmatter
     lines.append("---")
     lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
+    lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
     if cwd:
         # YAML 单引号包裹，避免 Windows \ 被解析为转义字符 / YAML single-quote to prevent \ escape interpretation
         lines.append(f"cwd: '{cwd}'")
-    lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
     if label:
         lines.append(f"label: {label}")
     if session_plan_refs:
@@ -555,12 +556,12 @@ def main():
         for subdir in sorted(TRANSCRIPTS_DIR.iterdir()):
             if not subdir.is_dir():
                 continue
-            jsonl_files = sorted(subdir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime)
+            # 按 mtime 降序尝试提取 cwd，避免 stub 文件 / Try newest JSONLs first to avoid stub files with no cwd
+            jsonl_files = sorted(subdir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
             if not jsonl_files:
                 continue
             total_jsonl += len(jsonl_files)
-            # 从该子目录下任意 JSONL 获取 cwd，生成新文件夹名 / Get cwd from any JSONL in subdir, generate new folder name
-            cwd = get_cwd_from_jsonl(jsonl_files[0])
+            cwd = get_cwd_from_jsonl(*jsonl_files)
             folder_name = resolve_folder_name(cwd, used_names) if cwd else subdir.name
             output_subdir = OBSIDIAN_DIR / folder_name
             if cwd:
