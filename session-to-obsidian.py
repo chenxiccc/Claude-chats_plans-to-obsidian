@@ -617,7 +617,6 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
         for t in pending_tools:
             lines.append(f"- {escape_obsidian_tags(t).replace(chr(10), ' ')}")
         lines.append("</details>")
-        lines.append("")
         pending_tools.clear()
         pending_ts = ""
 
@@ -629,8 +628,6 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             flush_pending_tools()
             round_num += 1
             if round_num > 1:
-                lines.append("")
-                lines.append("---")
                 lines.append("")
             lines.append(f"# Round {round_num}")
             lines.append(f"**用户** `{format_timestamp(m['timestamp'])}`")
