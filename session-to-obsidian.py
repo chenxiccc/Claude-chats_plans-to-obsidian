@@ -451,7 +451,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
                 lines.append("<details><summary>工具调用</summary>")
                 lines.append("")
                 for t in m["tools"]:
-                    lines.append(f"- {t}")
+                    lines.append(f"- {escape_obsidian_tags(t)}")
                 lines.append("")
                 lines.append("</details>")
                 lines.append("")
