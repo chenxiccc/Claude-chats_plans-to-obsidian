@@ -328,6 +328,7 @@ def parse_transcript(filepath):
                             tools_used.append(f"`Read`: {fp}")
                         elif tool_name == "Bash":
                             cmd = tool_input.get("command", "")
+                            cmd = cmd.replace("\n", " ")  # 换行符会破坏 markdown 格式 / newlines break markdown formatting
                             if len(cmd) > 120:
                                 cmd = cmd[:120] + "..."
                             tools_used.append(f"`Bash`: `{cmd}`")
@@ -614,7 +615,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
         lines.append(f"**Claude** `{pending_ts}`")
         lines.append("<details><summary>工具调用</summary>")
         for t in pending_tools:
-            lines.append(f"- {escape_obsidian_tags(t)}")
+            lines.append(f"- {escape_obsidian_tags(t).replace(chr(10), ' ')}")
         lines.append("</details>")
         pending_tools.clear()
         pending_ts = ""
@@ -668,7 +669,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             if has_tools:
                 lines.append("<details><summary>工具调用</summary>")
                 for t in m["tools"]:
-                    lines.append(f"- {escape_obsidian_tags(t)}")
+                    lines.append(f"- {escape_obsidian_tags(t).replace(chr(10), ' ')}")
                 lines.append("</details>")
 
             if has_plans:
