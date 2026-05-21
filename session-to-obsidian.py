@@ -418,8 +418,13 @@ def format_datetime(ts_str):
 
 
 def escape_obsidian_tags(text):
-    """转义 # 号防止 Obsidian 误识别为标签（# 后紧跟字母/数字/中文时转义）"""
-    return re.sub(r'(^|[\s\W])#(?=[\w一-鿿])', r'\1\\#', text)
+    """转义特殊字符防止 Obsidian 误解析 / Escape special characters to prevent Obsidian misparsing"""
+    # 转义 # 号防止误识别为标签 / Escape # to prevent tag recognition
+    text = re.sub(r'(^|[\s\W])#(?=[\w一-鿿])', r'\1\\#', text)
+    # 转义 <details> 和 </details> 防止与工具调用折叠块混淆 / Escape <details>/</details> in text
+    text = text.replace("</details>", "<\\/details>")
+    text = re.sub(r'<details(\s|>)', r'<\\details\1', text)
+    return text
 
 
 def sanitize_markdown_links(text: str) -> str:
