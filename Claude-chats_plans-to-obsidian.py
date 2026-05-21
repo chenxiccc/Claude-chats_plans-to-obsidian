@@ -342,10 +342,7 @@ def _extract_tool_result_text(c: dict, d: dict, parts: list[str]) -> None:
                     parts.append("[已拒绝]")
         return
 
-    # 普通 tool_result 文本 / Generic tool_result text
-    tr_text = c.get("content", "")
-    if isinstance(tr_text, str) and tr_text:
-        parts.append(tr_text)
+    # 其他 tool_result（Bash 输出等）不展示 / Skip other tool_results (Bash output etc.)
 
 
 def parse_transcript(filepath):
@@ -733,8 +730,6 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
         if m["role"] == "user":
             flush_pending_tools()
             round_num += 1
-            if round_num > 1:
-                lines.append("")
             lines.append(f"# Round {round_num}")
             lines.append(f"**用户** `{format_timestamp(m['timestamp'])}`")
             text = escape_obsidian_tags(m["text"])
