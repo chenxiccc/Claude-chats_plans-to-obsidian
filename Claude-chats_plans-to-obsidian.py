@@ -287,10 +287,12 @@ def _extract_ask_question_text(tool_input: dict, parts: list[str]) -> None:
 
 def _sanitize_text(text: str) -> str:
     """统一清理文本中的干扰内容 / Unified text sanitization"""
-    # 移除非法 XML/HTML 字符
-    text = text.replace("\x00", "")  # null bytes
-    # 移除 ANSI 转义序列
+    text = text.replace("\x00", "")
     text = _ANSI_ESCAPE_RE.sub('', text)
+    # 闭合未关闭的代码围栏，防止后续内容被吞入代码块 / Close unclosed code fences
+    fences = re.findall(r'^```', text, re.MULTILINE)
+    if len(fences) % 2 != 0:
+        text = text.rstrip() + "\n```"
     return text
 
 
@@ -459,6 +461,7 @@ def parse_transcript(filepath):
                     # skip thinking, tool_result etc.
 
                 text = "\n\n".join(parts)
+                text = _sanitize_text(text)
                 if not text and not tools_used:
                     continue
 
@@ -678,7 +681,10 @@ def resolve_plan_refs_from_timeline(messages: list[dict],
 
 
 def _truncate_text(text: str, max_len: int) -> str:
-    return text[:max_len] + "\n\n... (已截断)" if len(text) > max_len else text
+    if len(text) <= max_len:
+        return text
+    text = text[:max_len] + "\n\n... (已截断)"
+    return _sanitize_text(text)
 
 
 def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, cwd=None, label=None):
