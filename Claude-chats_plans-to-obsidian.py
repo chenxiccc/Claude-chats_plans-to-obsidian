@@ -111,6 +111,7 @@ _SKIP_PATTERNS = [
     re.compile(r"^<context-window-compacted>"),
     re.compile(r"^Tool loaded\.$"),
     re.compile(r"^Human:"),
+    re.compile(r"^\[Request interrupted by user"),
 ]
 
 # plan 映射缓存（按输出目录缓存） / Plan mapping cache (keyed by output directory)
@@ -397,6 +398,21 @@ def parse_transcript(filepath):
                             tools_used.append(f"`{short}`")
                         else:
                             tools_used.append(f"`{tool_name}`")
+
+                        # AskUserQuestion：提取问题文本为可见内容 / Extract question text as visible content
+                        if tool_name == "AskUserQuestion":
+                            for q in tool_input.get("questions", []):
+                                if isinstance(q, str):
+                                    parts.append(f"**🤖 {q}**")
+                                elif isinstance(q, dict):
+                                    question = q.get("question", "")
+                                    if question:
+                                        parts.append(f"**🤖 {question}**")
+                                        opts = q.get("options", [])
+                                        if opts:
+                                            parts.append("\n".join(
+                                                f"- {o.get('label', '')}: {o.get('description', '')}" for o in opts
+                                            ))
 
                         _track_plan_write(tool_name, tool_input, timestamp, plan_writes)
                     # skip thinking, tool_result etc.
