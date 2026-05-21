@@ -268,6 +268,38 @@ def _track_plan_write(tool_name: str, tool_input: dict, timestamp: str,
     })
 
 
+def _extract_tool_result_text(c: dict, d: dict, parts: list[str]) -> None:
+    """从 tool_result 中提取用户回答文本 / Extract user answer text from tool_result"""
+    # AskUserQuestion 回答：从 toolUseResult 中提取结构化问答 / Structured Q&A from AskUserQuestion
+    tur = d.get("toolUseResult", {})
+    if isinstance(tur, dict) and "answers" in tur:
+        for q, a in tur["answers"].items():
+            parts.append(f"[回答] {q}: {a}")
+        return
+
+    # 用户拒绝工具调用但在对话框里输入了文字（如 ExitPlanMode 的 "tell claude what to do instead"）
+    # User rejected tool but typed feedback text
+    if c.get("is_error"):
+        tr_text = c.get("content", "")
+        if "doesn't want to proceed" in tr_text or "rejected" in tr_text:
+            # 尝试从 toolUseResult 字符串中提取用户文字 / Try extracting user text from toolUseResult
+            if isinstance(tur, str):
+                marker = "The user provided the following reason for the rejection: "
+                idx = tur.find(marker)
+                if idx >= 0:
+                    parts.append(tur[idx + len(marker):].strip())
+                elif "User chose to stay in plan mode" in tur:
+                    parts.append("[留在计划模式]")
+                else:
+                    parts.append("[已拒绝]")
+        return
+
+    # 普通 tool_result 文本 / Generic tool_result text
+    tr_text = c.get("content", "")
+    if isinstance(tr_text, str) and tr_text:
+        parts.append(tr_text)
+
+
 def parse_transcript(filepath):
     """解析 JSONL 转录文件，提取对话内容 / Parse JSONL transcript, extract conversation content
     返回: (messages, session_id, first_ts, last_ts, plan_writes)"""
@@ -299,10 +331,13 @@ def parse_transcript(filepath):
                 elif isinstance(content, list):
                     parts = []
                     for c in content:
-                        if isinstance(c, dict) and c.get("type") == "text":
+                        ct_inner = c.get("type") if isinstance(c, dict) else None
+                        if ct_inner == "text":
                             parts.append(c.get("text", ""))
-                        elif isinstance(c, dict) and c.get("type") == "image":
+                        elif ct_inner == "image":
                             parts.append("[图片]")
+                        elif ct_inner == "tool_result":
+                            _extract_tool_result_text(c, d, parts)
                     text = "\n".join(parts)
                 else:
                     text = str(content)
