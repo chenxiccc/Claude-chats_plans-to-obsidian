@@ -569,8 +569,9 @@ def resolve_plan_refs_from_timeline(messages: list[dict],
         for stem, cycles in plan_timeline.items():
             active: str | None = None
             for start_ts, end_ts, filename in cycles:
-                if start_ts <= ts:
+                if start_ts <= ts <= end_ts:
                     active = filename
+                    break
             if active:
                 refs.append(f"[[plans/{active}]]")
         if refs:
