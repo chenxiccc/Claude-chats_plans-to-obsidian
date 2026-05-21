@@ -620,6 +620,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
         lines.append("> [!note]- 工具调用")
         for t in tools:
             lines.append(f"> - {escape_obsidian_tags(t).replace('\n', ' ')}")
+        lines.append("")
 
     def flush_pending_tools():
         nonlocal pending_ts
