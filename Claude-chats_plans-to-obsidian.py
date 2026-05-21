@@ -99,6 +99,9 @@ def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
 # 文件名不安全字符（跨平台交集） / Filesystem-unsafe characters (cross-platform intersection)
 _UNSAFE_FILENAME_RE = re.compile(r'[/\\:*?"<>|]')
 
+# ANSI 转义序列（终端颜色码等） / ANSI escape sequences (terminal color codes etc.)
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
 # 预编译正则 / Precompiled regex patterns
 _SYSTEM_XML_TAG_RE = re.compile(
     r'<(system-reminder|local-command-caveat|command-name|command-message'
@@ -344,6 +347,7 @@ def parse_transcript(filepath):
                     text = str(content)
 
                 text = _SYSTEM_XML_TAG_RE.sub('', text)
+                text = _ANSI_ESCAPE_RE.sub('', text)
                 text = text.strip()
 
                 if not text:
