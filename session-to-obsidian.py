@@ -105,7 +105,7 @@ def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
 
 
 # 匹配 /.claude/plans/*.md 路径，兼容 Unix / Windows 分隔符 / Match /.claude/plans/*.md paths, cross-platform separators
-_PLAN_PATH_RE = re.compile(r'[/\\]\.claude[/\\]plans[/\\]([^\s)\]\*]+?)\.md')
+_PLAN_PATH_RE = re.compile(r'[/\\]\.claude[/\\]plans[/\\]([^\s)\]\*<>]+?)\.md')
 
 # 文件名不安全字符（跨平台交集） / Filesystem-unsafe characters (cross-platform intersection)
 _UNSAFE_FILENAME_RE = re.compile(r'[/\\:*?"<>|]')
@@ -662,14 +662,10 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
         if not pending_tools:
             return
         lines.append(f"**Claude** `{pending_ts}`")
-        lines.append("")
         lines.append("<details><summary>工具调用</summary>")
-        lines.append("")
         for t in pending_tools:
             lines.append(f"- {escape_obsidian_tags(t)}")
-        lines.append("")
         lines.append("</details>")
-        lines.append("")
         pending_tools.clear()
         pending_ts = ""
 
@@ -682,11 +678,8 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             round_num += 1
             if round_num > 1:
                 lines.append("---")
-                lines.append("")
             lines.append(f"# Round {round_num}")
-            lines.append("")
             lines.append(f"**用户** `{format_timestamp(m['timestamp'])}`")
-            lines.append("")
             text = escape_obsidian_tags(m["text"])
             text = sanitize_markdown_links(text)
             if len(text) > 2000:
@@ -694,7 +687,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             lines.append(text)
             if m.get("plan_refs"):
                 for ref in m["plan_refs"]:
-                    lines.append(f"> 📋 {ref}")
+                    lines.append(f"## 📋 {ref}")
             lines.append("")
 
         elif m["role"] == "assistant":
@@ -716,27 +709,23 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             flush_pending_tools()
 
             lines.append(f"**Claude** `{format_timestamp(m['timestamp'])}`")
-            lines.append("")
 
             if has_text:
                 if len(text) > 3000:
                     text = text[:3000] + "\n\n... (已截断)"
                 lines.append(text)
-                lines.append("")
 
             if has_tools:
                 lines.append("<details><summary>工具调用</summary>")
-                lines.append("")
                 for t in m["tools"]:
                     lines.append(f"- {escape_obsidian_tags(t)}")
-                lines.append("")
                 lines.append("</details>")
-                lines.append("")
 
             if has_plans:
                 for ref in m["plan_refs"]:
-                    lines.append(f"> 📋 {ref}")
-                lines.append("")
+                    lines.append(f"## 📋 {ref}")
+
+            lines.append("")
 
     # 末尾可能还有未 flush 的工具调用 / Flush remaining pending tools at end
     flush_pending_tools()
