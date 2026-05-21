@@ -242,14 +242,37 @@ def find_session_name(session_id: str) -> str | None:
 
 def format_frontmatter_datetime(ts_str):
     dt = _to_beijing_dt(ts_str)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S") if dt else ts_str[:19] if ts_str else ""
+    if dt: return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    return ts_str[:19] if ts_str else ""
+
+
+def _track_plan_write(tool_name: str, tool_input: dict, timestamp: str,
+                     plan_writes: list[dict]) -> None:
+    """如果是对 plan 文件的 Write/Edit，提取 H1 和内容追加到 plan_writes / Append to plan_writes if it's a Write/Edit to a plan file"""
+    if tool_name not in ("Write", "Edit"):
+        return
+    fp = tool_input.get("file_path", "")
+    if "/.claude/plans/" not in fp.replace("\\", "/"):
+        return
+    content = tool_input.get("content", "")
+    if not content:
+        return
+    h1 = extract_h1_from_content(content)
+    if not h1:
+        return
+    plan_writes.append({
+        "stem": Path(fp).stem,
+        "timestamp": timestamp,
+        "h1": h1,
+        "content": content,
+    })
 
 
 def parse_transcript(filepath):
     """解析 JSONL 转录文件，提取对话内容 / Parse JSONL transcript, extract conversation content
     返回: (messages, session_id, first_ts, last_ts, plan_writes)"""
     messages = []
-    plan_writes: list[dict] = []  # 追踪 plan 写入操作 / Track plan write operations
+    plan_writes: list[dict] = []
     session_id = None
     first_ts = None
     last_ts = None
@@ -340,21 +363,7 @@ def parse_transcript(filepath):
                         else:
                             tools_used.append(f"`{tool_name}`")
 
-                        # 追踪 plan 写入操作（用于版本管理和逐轮引用） / Track plan writes for versioning and per-round references
-                        if tool_name in ("Write", "Edit"):
-                            fp = tool_input.get("file_path", "")
-                            if "/.claude/plans/" in fp.replace("\\", "/"):
-                                stem = Path(fp).stem
-                                content = tool_input.get("content", "")
-                                if content:
-                                    h1 = extract_h1_from_content(content)
-                                    if h1:
-                                        plan_writes.append({
-                                            "stem": stem,
-                                            "timestamp": timestamp,
-                                            "h1": h1,
-                                            "content": content,
-                                        })
+                        _track_plan_write(tool_name, tool_input, timestamp, plan_writes)
                     # skip thinking, tool_result etc.
 
                 text = "\n\n".join(parts)
@@ -394,12 +403,14 @@ def extract_topic(messages):
 
 def format_timestamp(ts_str):
     dt = _to_beijing_dt(ts_str)
-    return dt.strftime("%H:%M:%S") if dt else ts_str[:19] if ts_str else ""
+    if dt: return dt.strftime("%H:%M:%S")
+    return ts_str[:19] if ts_str else ""
 
 
 def format_datetime(ts_str):
     dt = _to_beijing_dt(ts_str)
-    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ts_str[:19] if ts_str else ""
+    if dt: return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return ts_str[:19] if ts_str else ""
 
 
 def escape_obsidian_tags(text):
@@ -506,7 +517,6 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
 
     content_hash = hashlib.sha256(content.encode()).hexdigest()[:12]
 
-    # 检查是否已存在相同 hash 的版本 / Check if version with same hash already exists
     entry = mapping.get(stem)
     if entry and isinstance(entry, dict):
         for v in entry.get("versions", []):
@@ -515,10 +525,8 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
                 entry["current"] = v["name"]
                 return
 
-    # 生成文件名：{H1} {YYYYMMDD-HHMMSS}.md / Generate filename
     ts_compact = format_timestamp_for_filename(last["timestamp"])
     friendly_name = sanitize_plan_filename(h1)
-    # 截断过长的文件名 / Truncate overly long filenames
     if len(friendly_name) > 80:
         friendly_name = friendly_name[:80].rsplit(" ", 1)[0].rsplit("_", 1)[0]
     filename = f"{friendly_name} {ts_compact}.md"
@@ -533,7 +541,6 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
         filename = f"{stem_part}_{counter}.md"
         counter += 1
 
-    # 生成 YAML frontmatter / Generate YAML frontmatter
     fm_lines = ["---"]
     fm_lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
     fm_lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
@@ -544,11 +551,9 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
     fm_lines.append("")
     content = "\n".join(fm_lines) + content
 
-    # 写入版本文件 / Write version file
     version_path = plans_dir / filename
     version_path.write_text(content, encoding="utf-8")
 
-    # 更新映射 / Update mapping
     if stem not in mapping:
         mapping[stem] = {"current": None, "versions": []}
     if not isinstance(mapping[stem], dict):
@@ -588,7 +593,6 @@ def _truncate_text(text: str, max_len: int) -> str:
 
 
 def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, cwd=None, label=None):
-    """生成 Markdown 文档（含 frontmatter） / Generate Markdown document with frontmatter"""
     user_count = sum(1 for m in messages if m.get("role") == "user")
     assistant_count = sum(1 for m in messages if m.get("role") == "assistant")
 
@@ -615,16 +619,18 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     pending_tools: list[str] = []  # 缓存连续纯工具调用 / Buffer for consecutive pure-tool messages
     pending_ts: str = ""
 
+    def _render_tools(tools: list[str]):
+        lines.append("<details><summary>工具调用</summary>")
+        for t in tools:
+            lines.append(f"- {escape_obsidian_tags(t).replace('\n', ' ')}")
+        lines.append("</details>")
+
     def flush_pending_tools():
-        """输出缓存的纯工具调用（合并为一个 <details>）/ Flush buffered pure-tool calls as a single <details>"""
         nonlocal pending_ts
         if not pending_tools:
             return
         lines.append(f"**Claude** `{pending_ts}`")
-        lines.append("<details><summary>工具调用</summary>")
-        for t in pending_tools:
-            lines.append(f"- {escape_obsidian_tags(t).replace('\n', ' ')}")
-        lines.append("</details>")
+        _render_tools(pending_tools)
         pending_tools.clear()
         pending_ts = ""
 
@@ -656,7 +662,6 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             has_plans = bool(m.get("plan_refs"))
             has_tools = bool(m.get("tools"))
 
-            # 纯工具调用（无文本、无计划引用）→ 缓存合并 / Pure tool calls → buffer for merging
             if not has_text and not has_plans and has_tools:
                 if not pending_tools:
                     pending_ts = format_timestamp(m["timestamp"])
@@ -672,10 +677,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
                 lines.append(_truncate_text(text, 3000))
 
             if has_tools:
-                lines.append("<details><summary>工具调用</summary>")
-                for t in m["tools"]:
-                    lines.append(f"- {escape_obsidian_tags(t).replace('\n', ' ')}")
-                lines.append("</details>")
+                _render_tools(m["tools"])
 
             if has_plans:
                 lines.append("")
