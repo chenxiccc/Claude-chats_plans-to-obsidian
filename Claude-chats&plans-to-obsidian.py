@@ -437,7 +437,8 @@ def sanitize_markdown_links(text: str) -> str:
 
 
 def build_plan_versions(plan_writes: list[dict], messages: list[dict],
-                        output_subdir: Path) -> dict[str, list[tuple[str, str, str]]]:
+                        output_subdir: Path,
+                        cwd: str | None = None) -> dict[str, list[tuple[str, str, str]]]:
     """按用户消息边界将 plan_writes 分组为编辑周期，创建版本文件，更新 .plan_mapping.json。
     返回: {stem: [(start_ts, end_ts, version_filename), ...]} 时间线
     Group plan writes into edit cycles by user-message boundaries, create version files,
@@ -471,7 +472,7 @@ def build_plan_versions(plan_writes: list[dict], messages: list[dict],
                 current_cycle[-1]["timestamp"], w["timestamp"], user_ts_list
             ):
                 # 保存上一个周期 / Save previous cycle
-                _save_cycle(stem, current_cycle, output_subdir, mapping)
+                _save_cycle(stem, current_cycle, output_subdir, mapping, cwd)
                 start_ts = current_cycle[0]["timestamp"]
                 end_ts = current_cycle[-1]["timestamp"]
                 version_file = mapping[stem]["current"] if stem in mapping else ""
@@ -481,7 +482,7 @@ def build_plan_versions(plan_writes: list[dict], messages: list[dict],
 
         # 最后一个周期 / Last cycle
         if current_cycle:
-            _save_cycle(stem, current_cycle, output_subdir, mapping)
+            _save_cycle(stem, current_cycle, output_subdir, mapping, cwd)
             start_ts = current_cycle[0]["timestamp"]
             end_ts = current_cycle[-1]["timestamp"]
             version_file = mapping[stem]["current"] if stem in mapping else ""
@@ -499,12 +500,13 @@ def _has_user_boundary_between(ts1: str, ts2: str, user_ts_list: list[str]) -> b
 
 
 def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
-                mapping: dict) -> None:
+                mapping: dict, cwd: str | None = None) -> None:
     """保存单个编辑周期为版本文件 / Save a single edit cycle as a version file"""
-    # 找最后一次 Write 操作（有完整 content） / Find the last Write operation (has full content)
     last = cycle_writes[-1]
     content = last.get("content", "")
     h1 = last.get("h1", "")
+    first_ts = cycle_writes[0]["timestamp"]
+    last_ts = last["timestamp"]
 
     # 如果周期内只有 Edit 没有 Write，从源文件读取当前内容 / If cycle has only Edits, read from source
     if not content:
@@ -544,6 +546,17 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
         stem_part = base.rsplit(".md", 1)[0]
         filename = f"{stem_part}_{counter}.md"
         counter += 1
+
+    # 生成 YAML frontmatter / Generate YAML frontmatter
+    fm_lines = ["---"]
+    fm_lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
+    fm_lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
+    if cwd:
+        fm_lines.append(f"cwd: '{cwd}'")
+    fm_lines.append(f"ref_plan_file: {stem}.md")
+    fm_lines.append("---")
+    fm_lines.append("")
+    content = "\n".join(fm_lines) + content
 
     # 写入版本文件 / Write version file
     version_path = plans_dir / filename
@@ -734,7 +747,7 @@ def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -
         return None
 
     # 构建 plan 版本时间线并创建版本文件 / Build plan version timeline and create version files
-    plan_timeline = build_plan_versions(plan_writes, messages, output_subdir)
+    plan_timeline = build_plan_versions(plan_writes, messages, output_subdir, cwd)
 
     # 按消息时间戳匹配活跃 plan 版本 / Match active plan versions per message timestamp
     resolve_plan_refs_from_timeline(messages, plan_timeline)
