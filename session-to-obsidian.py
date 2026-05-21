@@ -21,15 +21,6 @@ from pathlib import Path
 OBSIDIAN_DIR = Path.home() / "Obsidian" / "Project" / "claude" / "session"
 TRANSCRIPTS_DIR = Path.home() / ".claude" / "projects"
 
-# 是否在会话记录中引用 Obsidian 中的计划文件 / Reference plan files in Obsidian via wikilinks
-# 0 = 不引用，工具调用中对计划文件的 Write/Edit/Read 操作保持折叠在 <details> 中
-# 1 = 生成 [[filename]] wikilink 引用 Obsidian 中同名的计划文件（不折叠，直接可见）
-# 引用的前提：需先将 ~/.claude/plans 软链接到 Obsidian vault 下，操作方式：
-#   mkdir -p ~/Obsidian/Project/claude
-#   ln -s ~/.claude/plans ~/Obsidian/Project/claude/plans
-
-REFERENCE_PLANS_IN_OBSIDIAN = 1
-
 CHINA_TZ = timezone(timedelta(hours=8))
 
 
@@ -104,9 +95,6 @@ def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
     mapping_file.write_text(json.dumps(name_to_cwd, ensure_ascii=False, indent=2))
 
 
-# 匹配 /.claude/plans/*.md 路径，兼容 Unix / Windows 分隔符 / Match /.claude/plans/*.md paths, cross-platform separators
-_PLAN_PATH_RE = re.compile(r'[/\\]\.claude[/\\]plans[/\\]([^\s)\]\*<>]+?)\.md')
-
 # 文件名不安全字符（跨平台交集） / Filesystem-unsafe characters (cross-platform intersection)
 _UNSAFE_FILENAME_RE = re.compile(r'[/\\:*?"<>|]')
 
@@ -174,56 +162,6 @@ def save_plan_mapping(output_subdir: Path, mapping: dict) -> None:
     plans_dir.mkdir(parents=True, exist_ok=True)
     mapping_file = plans_dir / ".plan_mapping.json"
     mapping_file.write_text(json.dumps(mapping, ensure_ascii=False, indent=2))
-
-
-def extract_plan_refs(text: str, timestamp: str | None = None,
-                      plan_timeline: dict | None = None,
-                      output_subdir: Path | None = None) -> list[str]:
-    """从文本中提取 .claude/plans/*.md 引用，返回去重 wikilink 列表（按时间戳匹配版本，加 plans/ 前缀）
-    Extract plan refs from text, return deduplicated wikilinks with version matching and plans/ prefix"""
-    if not REFERENCE_PLANS_IN_OBSIDIAN:
-        return []
-    names = _PLAN_PATH_RE.findall(text)
-
-    # 加载映射用于兜底 / Load mapping for fallback
-    mapping = {}
-    if output_subdir:
-        mapping = load_plan_mapping(output_subdir)
-
-    seen: set[str] = set()
-    refs: list[str] = []
-    for name in names:
-        target = None
-        # 优先按时间戳匹配 / Prefer timestamp-based version matching
-        if timestamp and plan_timeline and name in plan_timeline:
-            target = _find_version_at_time(name, timestamp, plan_timeline[name])
-        # 兜底：使用映射中的 current 版本 / Fallback: use current version from mapping
-        if not target:
-            entry = mapping.get(name, {})
-            if isinstance(entry, dict):
-                target = entry.get("current", name)
-            else:
-                target = entry if entry else name
-        # 最终兜底：原始 stem / Ultimate fallback: original stem
-        if not target:
-            target = name
-
-        if target not in seen:
-            seen.add(target)
-            refs.append(f"[[plans/{target}]]")
-    return refs
-
-
-def _find_version_at_time(stem: str, ts: str, cycles: list) -> str | None:
-    """在 stem 的编辑周期列表中，找到 ts 时刻对应的版本文件名（不含 plans/ 前缀）
-    Find the version filename for a given timestamp in the edit cycle list"""
-    for start_ts, end_ts, filename in cycles:
-        if start_ts <= ts <= end_ts:
-            return filename
-    # ts 早于第一个周期 → 返回第一个版本 / ts before first cycle → return first version
-    if cycles:
-        return cycles[0][2]
-    return None
 
 
 # VS Code 会话标签缓存（首次调用时构建）
@@ -357,9 +295,6 @@ def parse_transcript(filepath):
                     continue
 
                 msg = {"role": "user", "text": text, "timestamp": timestamp, "_is_user_boundary": True}
-                plan_refs = extract_plan_refs(text)
-                if plan_refs:
-                    msg["plan_refs"] = plan_refs
                 messages.append(msg)
                 last_ts = timestamp
 
@@ -408,7 +343,7 @@ def parse_transcript(filepath):
                         # 追踪 plan 写入操作（用于版本管理和逐轮引用） / Track plan writes for versioning and per-round references
                         if tool_name in ("Write", "Edit"):
                             fp = tool_input.get("file_path", "")
-                            if _PLAN_PATH_RE.search(fp):
+                            if "/.claude/plans/" in fp.replace("\\", "/"):
                                 stem = Path(fp).stem
                                 content = tool_input.get("content", "")
                                 if content:
@@ -426,16 +361,9 @@ def parse_transcript(filepath):
                 if not text and not tools_used:
                     continue
 
-                # 从文本和工具调用路径中提取计划文件引用 / Extract plan refs from text and tool paths
-                scan_text = text
-                if tools_used:
-                    scan_text += "\n" + "\n".join(tools_used)
-                plan_refs = extract_plan_refs(scan_text)
                 msg = {"role": "assistant", "text": text, "timestamp": timestamp}
                 if tools_used:
                     msg["tools"] = tools_used
-                if plan_refs:
-                    msg["plan_refs"] = plan_refs
                 messages.append(msg)
                 last_ts = timestamp
 
@@ -628,6 +556,27 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
     })
 
 
+def resolve_plan_refs_from_timeline(messages: list[dict],
+                                    plan_timeline: dict[str, list[tuple[str, str, str]]]) -> None:
+    """按消息时间戳匹配活跃 plan 版本，直接设置 m['plan_refs'] / Match active plan versions per message timestamp"""
+    if not plan_timeline:
+        return
+    for m in messages:
+        ts = m.get("timestamp")
+        if not ts:
+            continue
+        refs: list[str] = []
+        for stem, cycles in plan_timeline.items():
+            active: str | None = None
+            for start_ts, end_ts, filename in cycles:
+                if start_ts <= ts:
+                    active = filename
+            if active:
+                refs.append(f"[[plans/{active}]]")
+        if refs:
+            m["plan_refs"] = refs
+
+
 def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, cwd=None, label=None):
     """生成 Markdown 文档（含 frontmatter） / Generate Markdown document with frontmatter"""
     user_count = sum(1 for m in messages if m.get("role") == "user")
@@ -778,20 +727,8 @@ def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -
     # 构建 plan 版本时间线并创建版本文件 / Build plan version timeline and create version files
     plan_timeline = build_plan_versions(plan_writes, messages, output_subdir)
 
-    # 按时间戳修正每个消息的 plan 引用 / Resolve plan refs per message timestamp
-    if plan_timeline:
-        for m in messages:
-            if m.get("plan_refs"):
-                # 重建扫描文本以重新提取引用 / Rebuild scan text to re-extract refs
-                scan_text = m.get("text", "")
-                if m.get("tools"):
-                    scan_text += "\n" + "\n".join(m["tools"])
-                m["plan_refs"] = extract_plan_refs(
-                    scan_text,
-                    timestamp=m.get("timestamp"),
-                    plan_timeline=plan_timeline,
-                    output_subdir=output_subdir,
-                )
+    # 按消息时间戳匹配活跃 plan 版本 / Match active plan versions per message timestamp
+    resolve_plan_refs_from_timeline(messages, plan_timeline)
 
     topic = extract_topic(messages)
 
