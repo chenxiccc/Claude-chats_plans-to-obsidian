@@ -250,6 +250,50 @@ def format_frontmatter_datetime(ts_str):
     return ts_str[:19] if ts_str else ""
 
 
+def _extract_ask_question_text(tool_input: dict, parts: list[str]) -> None:
+    """安全提取 AskUserQuestion 问题文本 / Safely extract AskUserQuestion question text"""
+    questions = tool_input.get("questions")
+    if not questions:
+        return
+    # 防御：questions 可能是 JSON 字符串 / Defend against JSON string format
+    if isinstance(questions, str):
+        try:
+            questions = json.loads(questions)
+        except (json.JSONDecodeError, TypeError):
+            # JSON 解析失败，尝试正则提取问题文本 / Try regex extraction on malformed JSON
+            m = re.search(r'"question"\s*:\s*"([^"]*)"', questions)
+            if m:
+                parts.append(f"**🤖 {m.group(1)}**")
+            return
+    # 统一为列表处理 / Normalize to list
+    if isinstance(questions, dict):
+        questions = [questions]
+    if not isinstance(questions, list):
+        return
+    for q in questions:
+        if isinstance(q, str):
+            parts.append(f"**🤖 {q}**")
+        elif isinstance(q, dict):
+            question = q.get("question", "")
+            if question:
+                parts.append(f"**🤖 {question}**")
+                opts = q.get("options", [])
+                if isinstance(opts, list):
+                    parts.append("\n".join(
+                        f"- {o.get('label', '')}: {o.get('description', '')}"
+                        for o in opts if isinstance(o, dict)
+                    ))
+
+
+def _sanitize_text(text: str) -> str:
+    """统一清理文本中的干扰内容 / Unified text sanitization"""
+    # 移除非法 XML/HTML 字符
+    text = text.replace("\x00", "")  # null bytes
+    # 移除 ANSI 转义序列
+    text = _ANSI_ESCAPE_RE.sub('', text)
+    return text
+
+
 def _track_plan_write(tool_name: str, tool_input: dict, timestamp: str,
                      plan_writes: list[dict]) -> None:
     """如果是对 plan 文件的 Write/Edit，提取 H1 和内容追加到 plan_writes / Append to plan_writes if it's a Write/Edit to a plan file"""
@@ -347,7 +391,7 @@ def parse_transcript(filepath):
                     text = str(content)
 
                 text = _SYSTEM_XML_TAG_RE.sub('', text)
-                text = _ANSI_ESCAPE_RE.sub('', text)
+                text = _sanitize_text(text)
                 text = text.strip()
 
                 if not text:
@@ -403,20 +447,13 @@ def parse_transcript(filepath):
                         else:
                             tools_used.append(f"`{tool_name}`")
 
-                        # AskUserQuestion：提取问题文本为可见内容 / Extract question text as visible content
+                        # AskUserQuestion / ExitPlanMode：提取文本为可见内容 / Extract text as visible content
                         if tool_name == "AskUserQuestion":
-                            for q in tool_input.get("questions", []):
-                                if isinstance(q, str):
-                                    parts.append(f"**🤖 {q}**")
-                                elif isinstance(q, dict):
-                                    question = q.get("question", "")
-                                    if question:
-                                        parts.append(f"**🤖 {question}**")
-                                        opts = q.get("options", [])
-                                        if opts:
-                                            parts.append("\n".join(
-                                                f"- {o.get('label', '')}: {o.get('description', '')}" for o in opts
-                                            ))
+                            _extract_ask_question_text(tool_input, parts)
+                        elif tool_name == "ExitPlanMode":
+                            plan = tool_input.get("plan", "")
+                            if plan:
+                                parts.append(f"**📋 计划提案**\n{plan[:2000]}")
 
                         _track_plan_write(tool_name, tool_input, timestamp, plan_writes)
                     # skip thinking, tool_result etc.
@@ -725,11 +762,11 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
 
             lines.append(f"**Claude** `{format_timestamp(m['timestamp'])}`")
 
-            if has_text:
-                lines.append(_truncate_text(text, 3000))
-
             if has_tools:
                 _render_tools(m["tools"])
+
+            if has_text:
+                lines.append(_truncate_text(text, 3000))
 
             if has_plans:
                 lines.append("")
