@@ -417,9 +417,6 @@ def escape_obsidian_tags(text):
     """转义特殊字符防止 Obsidian 误解析 / Escape special characters to prevent Obsidian misparsing"""
     # 转义 # 号防止误识别为标签 / Escape # to prevent tag recognition
     text = re.sub(r'(^|[\s\W])#(?=[\w一-鿿])', r'\1\\#', text)
-    # 转义 <details> 和 </details> 防止与工具调用折叠块混淆 / Escape <details>/</details> in text
-    text = text.replace("</details>", "<\\/details>")
-    text = re.sub(r'<details(\s|>)', r'<\\details\1', text)
     return text
 
 
@@ -620,10 +617,9 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     pending_ts: str = ""
 
     def _render_tools(tools: list[str]):
-        lines.append("<details><summary>工具调用</summary>")
+        lines.append("> [!note]- 工具调用")
         for t in tools:
-            lines.append(f"- {escape_obsidian_tags(t).replace('\n', ' ')}")
-        lines.append("</details>")
+            lines.append(f"> - {escape_obsidian_tags(t).replace('\n', ' ')}")
 
     def flush_pending_tools():
         nonlocal pending_ts
