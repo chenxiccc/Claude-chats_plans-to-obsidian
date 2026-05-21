@@ -324,7 +324,7 @@ def _extract_tool_result_text(c: dict, d: dict, parts: list[str]) -> None:
     tur = d.get("toolUseResult", {})
     if isinstance(tur, dict) and "answers" in tur:
         for q, a in tur["answers"].items():
-            parts.append(f"[回答] {q}: {a}")
+            parts.append(f"**回答** {q}: {a}")
         return
 
     # 用户拒绝工具调用但在对话框里输入了文字（如 ExitPlanMode 的 "tell claude what to do instead"）
