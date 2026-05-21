@@ -428,8 +428,10 @@ def parse_transcript(filepath):
 
                         # AskUserQuestion / ExitPlanMode：提取文本为可见内容，不放入工具调用折叠 / Extract as visible text, skip tools callout
                         if tool_name == "AskUserQuestion":
+                            parts.append("`AskUserQuestion`")
                             _extract_ask_question_text(tool_input, parts)
                         elif tool_name == "ExitPlanMode":
+                            parts.append("`ExitPlanMode`")
                             plan = tool_input.get("plan", "")
                             if plan:
                                 parts.append(f"**📋 计划提案**\n{plan[:2000]}")
