@@ -425,8 +425,8 @@ def sanitize_markdown_links(text: str) -> str:
     """去掉 Markdown 链接格式避免 Obsidian 误渲染 / Strip markdown link syntax to avoid Obsidian misrendering"""
     # [text](url) → text (url) — 纯文本保留路径 / plain text with path
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', text)
-    # 独立 [text] → 去掉方括号 / standalone [text] → remove brackets
-    text = re.sub(r'\[([^\]]+)\](?!\()', r'\1', text)
+    # 独立 [text] → 去掉方括号（保留 [[wikilink]]）/ standalone [text] → remove brackets (preserve [[wikilink]])
+    text = re.sub(r'(?<!\[)\[([^\]]+)\](?!\])', r'\1', text)
     return text
 
 
