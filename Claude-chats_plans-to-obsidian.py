@@ -7,6 +7,7 @@ TRANSCRIPTS_DIR 下的每个项目子目录映射到 OBSIDIAN_DIR 下的子目�
 文件夹名由 JSONL 中的 cwd 字段派生：取最后一级项目名，冲突时逐级追加父目录。
 """
 
+import bisect
 import hashlib
 import json
 import os
@@ -98,6 +99,20 @@ def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
 # 文件名不安全字符（跨平台交集） / Filesystem-unsafe characters (cross-platform intersection)
 _UNSAFE_FILENAME_RE = re.compile(r'[/\\:*?"<>|]')
 
+# 预编译正则 / Precompiled regex patterns
+_SYSTEM_XML_TAG_RE = re.compile(
+    r'<(system-reminder|local-command-caveat|command-name|command-message'
+    r'|command-args|local-command-stdout|task-notification'
+    r'|ide_opened_file|ide_selection|ide_diagnostics)>[\s\S]*?</\1>'
+)
+_SKIP_PATTERNS = [
+    re.compile(r"^Base directory for this skill:"),
+    re.compile(r"^This session is being continued from"),
+    re.compile(r"^<context-window-compacted>"),
+    re.compile(r"^Tool loaded\.$"),
+    re.compile(r"^Human:"),
+]
+
 # plan 映射缓存（按输出目录缓存） / Plan mapping cache (keyed by output directory)
 _plan_mapping_cache: dict[str, dict] = {}
 
@@ -121,16 +136,20 @@ def sanitize_plan_filename(text: str) -> str:
     return text
 
 
-def format_timestamp_for_filename(ts_str: str) -> str:
-    """ISO 时间戳 → YYYYMMDD-HHMMSS（北京时间，无冒号等特殊符号） / ISO timestamp → compact Beijing time format"""
+def _to_beijing_dt(ts_str: str):
+    """ISO 时间戳 → 北京时间 datetime，失败返回 None / Parse ISO timestamp to Beijing datetime, return None on failure"""
     if not ts_str:
-        return ""
+        return None
     try:
         dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        dt = dt.astimezone(CHINA_TZ)
-        return dt.strftime("%Y%m%d-%H%M%S")
+        return dt.astimezone(CHINA_TZ)
     except Exception:
-        return ts_str[:19].replace(":", "").replace("T", "-")
+        return None
+
+
+def format_timestamp_for_filename(ts_str: str) -> str:
+    dt = _to_beijing_dt(ts_str)
+    return dt.strftime("%Y%m%d-%H%M%S") if dt else ""
 
 
 def load_plan_mapping(output_subdir: Path) -> dict:
@@ -222,15 +241,8 @@ def find_session_name(session_id: str) -> str | None:
 
 
 def format_frontmatter_datetime(ts_str):
-    """ISO 时间戳 → 北京时间 YYYY-MM-DDTHH:MM:SS（Obsidian datetime 格式）"""
-    if not ts_str:
-        return ""
-    try:
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        dt = dt.astimezone(CHINA_TZ)
-        return dt.strftime("%Y-%m-%dT%H:%M:%S")
-    except Exception:
-        return ts_str[:19]
+    dt = _to_beijing_dt(ts_str)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") if dt else ts_str[:19] if ts_str else ""
 
 
 def parse_transcript(filepath):
@@ -272,26 +284,13 @@ def parse_transcript(filepath):
                 else:
                     text = str(content)
 
-                # 过滤 Claude Code 系统注入的 XML 标签
-                text = re.sub(
-                    r'<(system-reminder|local-command-caveat|command-name|command-message'
-                    r'|command-args|local-command-stdout|task-notification'
-                    r'|ide_opened_file|ide_selection|ide_diagnostics)>[\s\S]*?</\1>',
-                    '', text)
+                text = _SYSTEM_XML_TAG_RE.sub('', text)
                 text = text.strip()
 
                 if not text:
                     continue
 
-                # 跳过 skill 激活指令和 context continuation 等非用户内容
-                skip_patterns = [
-                    r"^Base directory for this skill:",
-                    r"^This session is being continued from",
-                    r"^<context-window-compacted>",
-                    r"^Tool loaded\.$",
-                    r"^Human:",
-                ]
-                if any(re.match(p, text) for p in skip_patterns):
+                if any(p.match(text) for p in _SKIP_PATTERNS):
                     continue
 
                 msg = {"role": "user", "text": text, "timestamp": timestamp, "_is_user_boundary": True}
@@ -394,27 +393,13 @@ def extract_topic(messages):
 
 
 def format_timestamp(ts_str):
-    """ISO 时间戳 → 北京时间"""
-    if not ts_str:
-        return ""
-    try:
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        dt = dt.astimezone(CHINA_TZ)
-        return dt.strftime("%H:%M:%S")
-    except Exception:
-        return ts_str[:19]
+    dt = _to_beijing_dt(ts_str)
+    return dt.strftime("%H:%M:%S") if dt else ts_str[:19] if ts_str else ""
 
 
 def format_datetime(ts_str):
-    """ISO 时间戳 → 北京时间完整格式"""
-    if not ts_str:
-        return ""
-    try:
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        dt = dt.astimezone(CHINA_TZ)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return ts_str[:19]
+    dt = _to_beijing_dt(ts_str)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ts_str[:19] if ts_str else ""
 
 
 def escape_obsidian_tags(text):
@@ -496,7 +481,8 @@ def build_plan_versions(plan_writes: list[dict], messages: list[dict],
 
 def _has_user_boundary_between(ts1: str, ts2: str, user_ts_list: list[str]) -> bool:
     """检查 ts1 和 ts2 之间是否有用户消息边界 / Check if any user message boundary exists between ts1 and ts2"""
-    return any(ts1 < uts < ts2 for uts in user_ts_list)
+    idx = bisect.bisect_right(user_ts_list, ts1)
+    return idx < len(user_ts_list) and user_ts_list[idx] < ts2
 
 
 def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
@@ -597,6 +583,10 @@ def resolve_plan_refs_from_timeline(messages: list[dict],
             m["plan_refs"] = refs
 
 
+def _truncate_text(text: str, max_len: int) -> str:
+    return text[:max_len] + "\n\n... (已截断)" if len(text) > max_len else text
+
+
 def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, cwd=None, label=None):
     """生成 Markdown 文档（含 frontmatter） / Generate Markdown document with frontmatter"""
     user_count = sum(1 for m in messages if m.get("role") == "user")
@@ -633,7 +623,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
         lines.append(f"**Claude** `{pending_ts}`")
         lines.append("<details><summary>工具调用</summary>")
         for t in pending_tools:
-            lines.append(f"- {escape_obsidian_tags(t).replace(chr(10), ' ')}")
+            lines.append(f"- {escape_obsidian_tags(t).replace('\n', ' ')}")
         lines.append("</details>")
         pending_tools.clear()
         pending_ts = ""
@@ -651,13 +641,11 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             lines.append(f"**用户** `{format_timestamp(m['timestamp'])}`")
             text = escape_obsidian_tags(m["text"])
             text = sanitize_markdown_links(text)
-            if len(text) > 2000:
-                text = text[:2000] + "\n\n... (已截断)"
+            text = _truncate_text(text, 2000)
             lines.append(text)
             if m.get("plan_refs"):
                 lines.append("")
-                for ref in m["plan_refs"]:
-                    lines.append(f"## 📋 {ref}")
+                lines.extend(f"## 📋 {ref}" for ref in m["plan_refs"])
             lines.append("")
 
         elif m["role"] == "assistant":
@@ -681,20 +669,17 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             lines.append(f"**Claude** `{format_timestamp(m['timestamp'])}`")
 
             if has_text:
-                if len(text) > 3000:
-                    text = text[:3000] + "\n\n... (已截断)"
-                lines.append(text)
+                lines.append(_truncate_text(text, 3000))
 
             if has_tools:
                 lines.append("<details><summary>工具调用</summary>")
                 for t in m["tools"]:
-                    lines.append(f"- {escape_obsidian_tags(t).replace(chr(10), ' ')}")
+                    lines.append(f"- {escape_obsidian_tags(t).replace('\n', ' ')}")
                 lines.append("</details>")
 
             if has_plans:
                 lines.append("")
-                for ref in m["plan_refs"]:
-                    lines.append(f"## 📋 {ref}")
+                lines.extend(f"## 📋 {ref}" for ref in m["plan_refs"])
 
             lines.append("")
 
