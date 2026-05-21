@@ -425,35 +425,36 @@ def parse_transcript(filepath):
                     elif ct == "tool_use":
                         tool_name = c.get("name", "unknown")
                         tool_input = c.get("input", {})
-                        # 简化工具调用记录 / Simplify tool call records
-                        if tool_name in ("Glob", "Grep"):
-                            param = tool_input.get("file_path") or tool_input.get("pattern") or tool_input.get("path", "")
-                            tools_used.append(f"`{tool_name}`: {param}")
-                        elif tool_name == "Read":
-                            fp = tool_input.get("file_path", "")
-                            tools_used.append(f"`Read`: {fp}")
-                        elif tool_name == "Bash":
-                            cmd = tool_input.get("command", "")
-                            cmd = cmd.replace("\n", " ")  # 换行符会破坏 markdown 格式 / newlines break markdown formatting
-                            if len(cmd) > 120:
-                                cmd = cmd[:120] + "..."
-                            tools_used.append(f"`Bash`: `{cmd}`")
-                        elif tool_name in ("Edit", "Write"):
-                            fp = tool_input.get("file_path", "")
-                            tools_used.append(f"`{tool_name}`: {fp}")
-                        elif tool_name.startswith("mcp__"):
-                            short = tool_name.split("__")[-1]
-                            tools_used.append(f"`{short}`")
-                        else:
-                            tools_used.append(f"`{tool_name}`")
 
-                        # AskUserQuestion / ExitPlanMode：提取文本为可见内容 / Extract text as visible content
+                        # AskUserQuestion / ExitPlanMode：提取文本为可见内容，不放入工具调用折叠 / Extract as visible text, skip tools callout
                         if tool_name == "AskUserQuestion":
                             _extract_ask_question_text(tool_input, parts)
                         elif tool_name == "ExitPlanMode":
                             plan = tool_input.get("plan", "")
                             if plan:
                                 parts.append(f"**📋 计划提案**\n{plan[:2000]}")
+                        else:
+                            # 简化工具调用记录 / Simplify tool call records
+                            if tool_name in ("Glob", "Grep"):
+                                param = tool_input.get("file_path") or tool_input.get("pattern") or tool_input.get("path", "")
+                                tools_used.append(f"`{tool_name}`: {param}")
+                            elif tool_name == "Read":
+                                fp = tool_input.get("file_path", "")
+                                tools_used.append(f"`Read`: {fp}")
+                            elif tool_name == "Bash":
+                                cmd = tool_input.get("command", "")
+                                cmd = cmd.replace("\n", " ")
+                                if len(cmd) > 120:
+                                    cmd = cmd[:120] + "..."
+                                tools_used.append(f"`Bash`: `{cmd}`")
+                            elif tool_name in ("Edit", "Write"):
+                                fp = tool_input.get("file_path", "")
+                                tools_used.append(f"`{tool_name}`: {fp}")
+                            elif tool_name.startswith("mcp__"):
+                                short = tool_name.split("__")[-1]
+                                tools_used.append(f"`{short}`")
+                            else:
+                                tools_used.append(f"`{tool_name}`")
 
                         _track_plan_write(tool_name, tool_input, timestamp, plan_writes)
                     # skip thinking, tool_result etc.
