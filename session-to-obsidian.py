@@ -629,18 +629,9 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
 
 
 def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, cwd=None, label=None):
-    """生成 Markdown 文档（含 frontmatter）"""
+    """生成 Markdown 文档（含 frontmatter） / Generate Markdown document with frontmatter"""
     user_count = sum(1 for m in messages if m.get("role") == "user")
     assistant_count = sum(1 for m in messages if m.get("role") == "assistant")
-
-    # 收集整个会话涉及的计划文件（去重） / Collect session-wide plan refs (deduplicated)
-    session_plan_refs: list[str] = []
-    _seen_plans: set[str] = set()
-    for m in messages:
-        for ref in m.get("plan_refs", []):
-            if ref not in _seen_plans:
-                _seen_plans.add(ref)
-                session_plan_refs.append(ref)
 
     lines = []
     # YAML frontmatter
@@ -648,14 +639,9 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
     lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
     if cwd:
-        # YAML 单引号包裹，避免 Windows \ 被解析为转义字符 / YAML single-quote to prevent \ escape interpretation
         lines.append(f"cwd: '{cwd}'")
     if label:
         lines.append(f"label: {label}")
-    if session_plan_refs:
-        lines.append("plans:")
-        for ref in session_plan_refs:
-            lines.append(f'  - "{ref}"')
     lines.append("---")
     lines.append(f"> 时间：{format_datetime(first_ts)} ~ {format_datetime(last_ts)}")
     lines.append(f"> 轮数：用户 {user_count} 轮，Claude {assistant_count} 轮")
@@ -667,18 +653,40 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
     lines.append("")
 
     round_num = 0
+    pending_tools: list[str] = []  # 缓存连续纯工具调用 / Buffer for consecutive pure-tool messages
+    pending_ts: str = ""
+
+    def flush_pending_tools():
+        """输出缓存的纯工具调用（合并为一个 <details>）/ Flush buffered pure-tool calls as a single <details>"""
+        nonlocal pending_ts
+        if not pending_tools:
+            return
+        lines.append(f"**Claude** `{pending_ts}`")
+        lines.append("")
+        lines.append("<details><summary>工具调用</summary>")
+        lines.append("")
+        for t in pending_tools:
+            lines.append(f"- {escape_obsidian_tags(t)}")
+        lines.append("")
+        lines.append("</details>")
+        lines.append("")
+        pending_tools.clear()
+        pending_ts = ""
+
     for m in messages:
         if "role" not in m:
-            continue  # 跳过边界标记消息 / Skip boundary-only markers
-        ts = format_timestamp(m["timestamp"])
+            continue
 
         if m["role"] == "user":
+            flush_pending_tools()
             round_num += 1
-            lines.append(f"## Round {round_num}")
+            if round_num > 1:
+                lines.append("---")
+                lines.append("")
+            lines.append(f"# Round {round_num}")
             lines.append("")
-            lines.append(f"**用户** `{ts}`")
+            lines.append(f"**用户** `{format_timestamp(m['timestamp'])}`")
             lines.append("")
-            # 用户消息原文
             text = escape_obsidian_tags(m["text"])
             text = sanitize_markdown_links(text)
             if len(text) > 2000:
@@ -690,20 +698,33 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             lines.append("")
 
         elif m["role"] == "assistant":
-            lines.append(f"**Claude** `{ts}`")
+            text = escape_obsidian_tags(m.get("text", ""))
+            text = sanitize_markdown_links(text)
+            text = text.strip()
+            has_text = bool(text)
+            has_plans = bool(m.get("plan_refs"))
+            has_tools = bool(m.get("tools"))
+
+            # 纯工具调用（无文本、无计划引用）→ 缓存合并 / Pure tool calls → buffer for merging
+            if not has_text and not has_plans and has_tools:
+                if not pending_tools:
+                    pending_ts = format_timestamp(m["timestamp"])
+                pending_tools.extend(m["tools"])
+                continue
+
+            # 有意义消息 → 先 flush 缓存的工具调用 / Meaningful message → flush pending tools first
+            flush_pending_tools()
+
+            lines.append(f"**Claude** `{format_timestamp(m['timestamp'])}`")
             lines.append("")
 
-            # 回复内容 / Response text
-            text = escape_obsidian_tags(m["text"])
-            text = sanitize_markdown_links(text)
-            if len(text) > 3000:
-                text = text[:3000] + "\n\n... (已截断)"
-            if text:
+            if has_text:
+                if len(text) > 3000:
+                    text = text[:3000] + "\n\n... (已截断)"
                 lines.append(text)
                 lines.append("")
 
-            # 工具调用（折叠） / Tool calls (folded)
-            if m.get("tools"):
+            if has_tools:
                 lines.append("<details><summary>工具调用</summary>")
                 lines.append("")
                 for t in m["tools"]:
@@ -712,14 +733,13 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
                 lines.append("</details>")
                 lines.append("")
 
-            # 计划文件引用（内容下方） / Plan file references (below content)
-            if m.get("plan_refs"):
+            if has_plans:
                 for ref in m["plan_refs"]:
                     lines.append(f"> 📋 {ref}")
                 lines.append("")
 
-            lines.append("---")
-            lines.append("")
+    # 末尾可能还有未 flush 的工具调用 / Flush remaining pending tools at end
+    flush_pending_tools()
 
     return "\n".join(lines)
 
