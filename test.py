@@ -28,6 +28,8 @@ TEST_MESSAGES = [
     {"type":"assistant","message":{"content":[{"type":"text","text":"输出格式如下：\n\n<details><summary>工具调用</summary>\n\n- `Read`: file.ts\n\n</details>\n\n注意空格"}]},"timestamp":"2026-05-21T10:01:01Z"},
     # 对话文本含未闭合的 ```json（sanitize 应自动补全）
     {"type":"assistant","message":{"content":[{"type":"text","text":"映射结构：\n\n```json\n{\n  \"stem\": {\n    \"current\": \"修复登录页bug 20260521-100000.md\"\n  }\n}"}]},"timestamp":"2026-05-21T10:01:02Z"},
+    # 模拟截断场景：末尾行是缩进+不完整的围栏（`  ```pyth`），sanitize 应移除 / Simulated truncation: trailing indented incomplete fence should be removed
+    {"type":"assistant","message":{"content":[{"type":"text","text":"- **修改**: 新增常量：\n  ```pyth"}]},"timestamp":"2026-05-21T10:01:03Z"},
     # 用户消息含 wikilink 和 #tag
     {"type":"user","userType":"external","message":{"content":[{"type":"text","text":"参考 [[某笔记]] 和 #tag1 的做法"}]},"timestamp":"2026-05-21T10:02:00Z"},
     # Bash tool_result（不应显示为用户消息内容）
@@ -92,6 +94,7 @@ check("使用 Obsidian callout 替代 <details>", "> [!note]- 工具调用" in o
 check("Bash heredoc 无换行断裂", output.count("\n> - `Bash`") <= output.count("> [!note]- 工具调用"))
 check("ANSI 转义码已清除", "[0;36m" not in output)
 check("代码围栏平衡", output.count("\n```") % 2 == 0)
+check("截断不完整围栏已移除", "```pyth" not in output)
 check("Null bytes 已清除", "\x00" not in output)
 
 # ===== 内容提取 =====

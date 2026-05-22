@@ -29,7 +29,7 @@ _VSCODE_LABEL_CACHE = Path.home() / ".claude" / ".vscode_labels_cache.json"
 # 截断与限制常量 / Truncation and limit constants
 _MAX_CWD_SCAN_LINES = 100
 _BASH_CMD_TRUNCATE = 120
-_PLAN_TEXT_TRUNCATE = 2000
+_PLAN_TEXT_TRUNCATE = 8000
 _USER_TEXT_TRUNCATE = 2000
 _ASSISTANT_TEXT_TRUNCATE = 3000
 _HASH_TRUNCATE_LEN = 12
@@ -330,10 +330,21 @@ def _sanitize_text(text: str) -> str:
     """统一清理文本中的干扰内容 / Unified text sanitization"""
     text = text.replace("\x00", "")
     text = _ANSI_ESCAPE_RE.sub('', text)
-    # 闭合未关闭的代码围栏，防止后续内容被吞入代码块 / Close unclosed code fences
-    fences = re.findall(r'^```', text, re.MULTILINE)
+    # 闭合未关闭的代码围栏，防止后续内容被吞入代码块
+    # Close unclosed code fences (CommonMark: up to 3 spaces indent, then 3+ backticks)
+    fences = re.findall(r'^ {0,3}```', text, re.MULTILINE)
     if len(fences) % 2 != 0:
-        text = text.rstrip() + "\n```"
+        lines = text.split('\n')
+        # 移除末尾空白行，检查最后有效行是否是被截断的不完整围栏 / Strip trailing blanks, check for truncated fence
+        while lines and lines[-1] == '':
+            lines.pop()
+        if lines and re.match(r' {0,3}```\S+$', lines[-1]):
+            # 末尾是带语言标记的未完成围栏 → 字符截断产物，直接移除避免空代码块
+            # Trailing incomplete opening fence (language specifier present) → truncation artifact, remove it
+            lines.pop()
+            text = '\n'.join(lines)
+        else:
+            text = text.rstrip() + "\n```"
     return text
 
 
