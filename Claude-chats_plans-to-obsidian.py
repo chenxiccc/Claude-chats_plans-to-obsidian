@@ -19,13 +19,23 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ===== 配置 =====
-OBSIDIAN_DIR = Path.home() / "Obsidian" / "Project" / "claude" / "session"
-TRANSCRIPTS_DIR = Path.home() / ".claude" / "projects"
+OBSIDIAN_DIR = Path(os.environ.get("OBSIDIAN_DIR", Path.home() / "Obsidian" / "Project" / "claude" / "session"))
+TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", Path.home() / ".claude" / "projects"))
 
-CHINA_TZ = timezone(timedelta(hours=8))
+DISPLAY_TZ = timezone(timedelta(hours=8))
+PLANS_SOURCE_DIR = Path.home() / ".claude" / "plans"
+
+# 截断与限制常量 / Truncation and limit constants
+_MAX_CWD_SCAN_LINES = 100
+_BASH_CMD_TRUNCATE = 120
+_PLAN_TEXT_TRUNCATE = 2000
+_USER_TEXT_TRUNCATE = 2000
+_ASSISTANT_TEXT_TRUNCATE = 3000
+_HASH_TRUNCATE_LEN = 12
+_PLAN_FILENAME_MAX_LEN = 80
 
 
-def find_latest_transcript():
+def find_latest_transcript() -> Path | None:
     """跨所有项目子目录找最近修改的 .jsonl 文件"""
     latest = None
     latest_mtime = 0
@@ -46,7 +56,7 @@ def get_cwd_from_jsonl(*jsonl_paths: Path) -> str | None:
         try:
             with open(jsonl_path) as f:
                 for i, line in enumerate(f):
-                    if i >= 100:  # 前 100 行内必定有 user 消息 / user message always within first 100 lines
+                    if i >= _MAX_CWD_SCAN_LINES:  # 前 100 行内必定有 user 消息 / user message always within first 100 lines
                         break
                     try:
                         d = json.loads(line.strip())
@@ -77,23 +87,33 @@ def resolve_folder_name(cwd: str, used_names: set[str]) -> str:
     return name
 
 
+def _read_json_file(filepath: Path, default=None):
+    """安全读取 JSON 文件，失败返回 default / Safe JSON file read, return default on failure"""
+    if not filepath.exists():
+        return default
+    try:
+        return json.loads(filepath.read_text())
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def _write_json_file(filepath: Path, data) -> None:
+    """原子写入 JSON 文件 / Atomic JSON file write"""
+    tmp = filepath.with_suffix(filepath.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    os.replace(tmp, filepath)
+
+
 def load_cwd_mapping() -> dict[str, str]:
     """读取 cwd → folder_name 映射 / Load cwd → folder_name mapping"""
-    mapping_file = OBSIDIAN_DIR / ".cwd_mapping.json"
-    if not mapping_file.exists():
-        return {}
-    try:
-        # 文件存储为 {folder_name: cwd}，反转为 {cwd: folder_name} 便于查询 / File stores {folder_name: cwd}, invert for O(1) lookup
-        raw = json.loads(mapping_file.read_text())
-        return {cwd: name for name, cwd in raw.items()}
-    except (json.JSONDecodeError, OSError):
-        return {}
+    # 文件存储为 {folder_name: cwd}，反转为 {cwd: folder_name} 便于查询 / File stores {folder_name: cwd}, invert for O(1) lookup
+    raw = _read_json_file(OBSIDIAN_DIR / ".cwd_mapping.json", {})
+    return {cwd: name for name, cwd in raw.items()}
 
 
 def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
     """全量写入 {folder_name: cwd} 映射 / Full rewrite of folder_name → cwd mapping"""
-    mapping_file = OBSIDIAN_DIR / ".cwd_mapping.json"
-    mapping_file.write_text(json.dumps(name_to_cwd, ensure_ascii=False, indent=2))
+    _write_json_file(OBSIDIAN_DIR / ".cwd_mapping.json", name_to_cwd)
 
 
 # 文件名不安全字符（跨平台交集） / Filesystem-unsafe characters (cross-platform intersection)
@@ -108,14 +128,13 @@ _SYSTEM_XML_TAG_RE = re.compile(
     r'|command-args|local-command-stdout|task-notification'
     r'|ide_opened_file|ide_selection|ide_diagnostics)>[\s\S]*?</\1>'
 )
-_SKIP_PATTERNS = [
-    re.compile(r"^Base directory for this skill:"),
-    re.compile(r"^This session is being continued from"),
-    re.compile(r"^<context-window-compacted>"),
-    re.compile(r"^Tool loaded\.$"),
-    re.compile(r"^Human:"),
-    re.compile(r"^\[Request interrupted by user"),
-]
+_SKIP_PREFIXES = (
+    "Base directory for this skill:",
+    "This session is being continued from",
+    "<context-window-compacted>",
+    "Human:",
+    "[Request interrupted by user",
+)
 
 # plan 映射缓存（按输出目录缓存） / Plan mapping cache (keyed by output directory)
 _plan_mapping_cache: dict[str, dict] = {}
@@ -140,51 +159,39 @@ def sanitize_plan_filename(text: str) -> str:
     return text
 
 
-def _to_beijing_dt(ts_str: str):
-    """ISO 时间戳 → 北京时间 datetime，失败返回 None / Parse ISO timestamp to Beijing datetime, return None on failure"""
+def _parse_ts_to_dt(ts_str: str) -> datetime | None:
+    """ISO 时间戳 → 本地时区 datetime，失败返回 None / Parse ISO timestamp to local datetime, return None on failure"""
     if not ts_str:
         return None
     try:
         dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        return dt.astimezone(CHINA_TZ)
-    except Exception:
+        return dt.astimezone(DISPLAY_TZ)
+    except (ValueError, OSError):
         return None
 
 
 def format_timestamp_for_filename(ts_str: str) -> str:
-    dt = _to_beijing_dt(ts_str)
+    dt = _parse_ts_to_dt(ts_str)
     return dt.strftime("%Y%m%d-%H%M%S") if dt else ""
 
 
-def load_plan_mapping(output_subdir: Path) -> dict:
+def load_plan_mapping(output_subdir: Path) -> dict[str, dict]:
     """加载项目 plan 映射文件 / Load per-project plan mapping {stem: {current, versions}}"""
     cache_key = str(output_subdir)
     if cache_key in _plan_mapping_cache:
         return _plan_mapping_cache[cache_key]
-
-    plans_dir = output_subdir / "plans"
-    mapping_file = plans_dir / ".plan_mapping.json"
-    if not mapping_file.exists():
-        _plan_mapping_cache[cache_key] = {}
-        return {}
-
-    try:
-        mapping = json.loads(mapping_file.read_text())
-        _plan_mapping_cache[cache_key] = mapping
-        return mapping
-    except (json.JSONDecodeError, OSError):
-        _plan_mapping_cache[cache_key] = {}
-        return {}
+    mapping = _read_json_file(output_subdir / "plans" / ".plan_mapping.json", {})
+    _plan_mapping_cache[cache_key] = mapping
+    return mapping
 
 
 def save_plan_mapping(output_subdir: Path, mapping: dict) -> None:
     """持久化项目 plan 映射 / Persist per-project plan mapping"""
-    cache_key = str(output_subdir)
-    _plan_mapping_cache[cache_key] = mapping
     plans_dir = output_subdir / "plans"
     plans_dir.mkdir(parents=True, exist_ok=True)
-    mapping_file = plans_dir / ".plan_mapping.json"
-    mapping_file.write_text(json.dumps(mapping, ensure_ascii=False, indent=2))
+    _write_json_file(plans_dir / ".plan_mapping.json", mapping)
+    # 写入成功后更新缓存 / Update cache only after successful write
+    _plan_mapping_cache[str(output_subdir)] = mapping
 
 
 # VS Code 会话标签缓存（首次调用时构建）
@@ -229,7 +236,7 @@ def build_vscode_label_index() -> dict[str, str]:
                                         index[sid] = label
                 except json.JSONDecodeError:
                     pass
-        except Exception:
+        except (json.JSONDecodeError, sqlite3.Error):
             continue
     return index
 
@@ -244,10 +251,16 @@ def find_session_name(session_id: str) -> str | None:
     return _vscode_labels.get(session_id)
 
 
-def format_frontmatter_datetime(ts_str):
-    dt = _to_beijing_dt(ts_str)
-    if dt: return dt.strftime("%Y-%m-%dT%H:%M:%S")
+def _format_ts(ts_str: str, fmt: str) -> str:
+    """时间戳 → 格式化字符串 / Timestamp → formatted string"""
+    dt = _parse_ts_to_dt(ts_str)
+    if dt:
+        return dt.strftime(fmt)
     return ts_str[:19] if ts_str else ""
+
+
+def format_frontmatter_datetime(ts_str: str) -> str:
+    return _format_ts(ts_str, "%Y-%m-%dT%H:%M:%S")
 
 
 def _extract_ask_question_text(tool_input: dict, parts: list[str]) -> None:
@@ -304,7 +317,20 @@ def _track_plan_write(tool_name: str, tool_input: dict, timestamp: str,
     fp = tool_input.get("file_path", "")
     if "/.claude/plans/" not in fp.replace("\\", "/"):
         return
-    content = tool_input.get("content", "")
+
+    # Edit 工具没有 content 字段（只有 old_string/new_string），从磁盘读取当前文件内容
+    # Edit tool has no content field — read current file from disk
+    if tool_name == "Edit":
+        source = Path(fp)
+        if not source.exists():
+            return
+        try:
+            content = source.read_text(encoding="utf-8")
+        except OSError:
+            return
+    else:
+        content = tool_input.get("content", "")
+
     if not content:
         return
     h1 = extract_h1_from_content(content)
@@ -329,6 +355,7 @@ def _extract_tool_result_text(c: dict, d: dict, parts: list[str]) -> None:
 
     # 用户拒绝工具调用但在对话框里输入了文字（如 ExitPlanMode 的 "tell claude what to do instead"）
     # User rejected tool but typed feedback text
+    # 注：以下英文匹配字符串依赖 Claude Code 内部消息格式，版本升级可能失效 / Note: fragile — depends on Claude Code internal message strings
     if c.get("is_error"):
         tr_text = c.get("content", "")
         if "doesn't want to proceed" in tr_text or "rejected" in tr_text:
@@ -347,9 +374,8 @@ def _extract_tool_result_text(c: dict, d: dict, parts: list[str]) -> None:
     # 其他 tool_result（Bash 输出等）不展示 / Skip other tool_results (Bash output etc.)
 
 
-def parse_transcript(filepath):
-    """解析 JSONL 转录文件，提取对话内容 / Parse JSONL transcript, extract conversation content
-    返回: (messages, session_id, first_ts, last_ts, plan_writes)"""
+def parse_transcript(filepath: Path) -> tuple[list[dict], str | None, str | None, str | None, list[dict]]:
+    """解析 JSONL 转录文件，提取对话内容 / Parse JSONL transcript, extract conversation content"""
     messages = []
     plan_writes: list[dict] = []
     session_id = None
@@ -362,6 +388,8 @@ def parse_transcript(filepath):
                 d = json.loads(line.strip())
             except json.JSONDecodeError:
                 continue
+            if not isinstance(d, dict):
+                continue
 
             msg_type = d.get("type")
             timestamp = d.get("timestamp", "")
@@ -372,7 +400,7 @@ def parse_transcript(filepath):
                 if not first_ts and timestamp:
                     first_ts = timestamp
 
-                content = d["message"].get("content", "")
+                content = d.get("message", {}).get("content", "")
                 if isinstance(content, str):
                     text = content
                 elif isinstance(content, list):
@@ -396,7 +424,7 @@ def parse_transcript(filepath):
                 if not text:
                     continue
 
-                if any(p.match(text) for p in _SKIP_PATTERNS):
+                if text == "Tool loaded." or text.startswith(_SKIP_PREFIXES):
                     continue
 
                 msg = {"role": "user", "text": text, "timestamp": timestamp, "_is_user_boundary": True}
@@ -409,7 +437,7 @@ def parse_transcript(filepath):
                 messages.append({"_is_user_boundary": True, "timestamp": timestamp})
 
             elif msg_type == "assistant":
-                content_items = d["message"].get("content", [])
+                content_items = d.get("message", {}).get("content", [])
                 parts = []
                 tools_used = []
 
@@ -433,7 +461,7 @@ def parse_transcript(filepath):
                             parts.append("`ExitPlanMode`")
                             plan = tool_input.get("plan", "")
                             if plan:
-                                parts.append(f"**📋 计划提案**\n{plan[:2000]}")
+                                parts.append(f"**📋 计划提案**\n{plan[:_PLAN_TEXT_TRUNCATE]}")
                         else:
                             # 简化工具调用记录 / Simplify tool call records
                             if tool_name in ("Glob", "Grep"):
@@ -445,8 +473,8 @@ def parse_transcript(filepath):
                             elif tool_name == "Bash":
                                 cmd = tool_input.get("command", "")
                                 cmd = cmd.replace("\n", " ")
-                                if len(cmd) > 120:
-                                    cmd = cmd[:120] + "..."
+                                if len(cmd) > _BASH_CMD_TRUNCATE:
+                                    cmd = cmd[:_BASH_CMD_TRUNCATE] + "..."
                                 tools_used.append(f"`Bash`: `{cmd}`")
                             elif tool_name in ("Edit", "Write"):
                                 fp = tool_input.get("file_path", "")
@@ -474,7 +502,7 @@ def parse_transcript(filepath):
     return messages, session_id, first_ts, last_ts, plan_writes
 
 
-def extract_topic(messages):
+def extract_topic(messages: list[dict]) -> str:
     """提取会话主题：取首条用户消息，按 East Asian Width 截断至 40 单位宽度"""
     for m in messages:
         if m.get("role") == "user":
@@ -496,29 +524,25 @@ def extract_topic(messages):
     return "未命名会话"
 
 
-def format_timestamp(ts_str):
-    dt = _to_beijing_dt(ts_str)
-    if dt: return dt.strftime("%H:%M:%S")
-    return ts_str[:19] if ts_str else ""
+def format_timestamp(ts_str: str) -> str:
+    return _format_ts(ts_str, "%H:%M:%S")
 
 
-def format_datetime(ts_str):
-    dt = _to_beijing_dt(ts_str)
-    if dt: return dt.strftime("%Y-%m-%d %H:%M:%S")
-    return ts_str[:19] if ts_str else ""
+def format_datetime(ts_str: str) -> str:
+    return _format_ts(ts_str, "%Y-%m-%d %H:%M:%S")
 
 
-def escape_obsidian_tags(text):
+def escape_obsidian_tags(text: str) -> str:
     """转义特殊字符防止 Obsidian 误解析 / Escape special characters to prevent Obsidian misparsing"""
     # 转义 # 号防止误识别为标签 / Escape # to prevent tag recognition
-    text = re.sub(r'(^|[\s\W])#(?=[\w一-鿿])', r'\1\\#', text)
+    text = re.sub(r'(^|\W)#(?=[\w぀-ゟ゠-ヿ가-힯一-鿿])', r'\1\\#', text)
     return text
 
 
 def sanitize_markdown_links(text: str) -> str:
     """去掉 Markdown 链接格式避免 Obsidian 误渲染 / Strip markdown link syntax to avoid Obsidian misrendering"""
     # [text](url) → text (url) — 纯文本保留路径 / plain text with path
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', text)
+    text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', r'\1 (\2)', text)
     # 独立 [text] → 去掉方括号（保留 [[wikilink]]）/ standalone [text] → remove brackets (preserve [[wikilink]])
     text = re.sub(r'(?<!\[)\[([^\]]+)\](?!\])', r'\1', text)
     return text
@@ -588,6 +612,21 @@ def _has_user_boundary_between(ts1: str, ts2: str, user_ts_list: list[str]) -> b
     return idx < len(user_ts_list) and user_ts_list[idx] < ts2
 
 
+def _deduplicate_filename(directory: Path, base_name: str, skip: Path | None = None) -> str:
+    """去重文件名，同名追加 _2 _3 / Deduplicate filename by appending _2 _3"""
+    filename = base_name
+    counter = 2
+    while True:
+        candidate = directory / filename
+        if not candidate.exists() or candidate == skip:
+            break
+        stem = base_name.rsplit(".", 1)[0]
+        ext = f".{base_name.rsplit('.', 1)[1]}" if "." in base_name else ""
+        filename = f"{stem}_{counter}{ext}"
+        counter += 1
+    return filename
+
+
 def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
                 mapping: dict, cwd: str | None = None) -> None:
     """保存单个编辑周期为版本文件 / Save a single edit cycle as a version file"""
@@ -597,9 +636,9 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
     first_ts = cycle_writes[0]["timestamp"]
     last_ts = last["timestamp"]
 
-    # 如果周期内只有 Edit 没有 Write，从源文件读取当前内容 / If cycle has only Edits, read from source
+    # 防御：如果 entry 无 content（如只读磁盘失败），从源文件回退读取 / Defensive: fallback to source file if no content
     if not content:
-        source = Path.home() / ".claude" / "plans" / f"{stem}.md"
+        source = PLANS_SOURCE_DIR / f"{stem}.md"
         if source.exists():
             content = source.read_text(encoding="utf-8")
             h1 = extract_h1_from_content(content) or h1
@@ -607,7 +646,7 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
     if not content or not h1:
         return
 
-    content_hash = hashlib.sha256(content.encode()).hexdigest()[:12]
+    content_hash = hashlib.sha256(content.encode()).hexdigest()[:_HASH_TRUNCATE_LEN]
 
     entry = mapping.get(stem)
     if entry and isinstance(entry, dict):
@@ -619,19 +658,14 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
 
     ts_compact = format_timestamp_for_filename(last["timestamp"])
     friendly_name = sanitize_plan_filename(h1)
-    if len(friendly_name) > 80:
-        friendly_name = friendly_name[:80].rsplit(" ", 1)[0].rsplit("_", 1)[0]
+    if len(friendly_name) > _PLAN_FILENAME_MAX_LEN:
+        friendly_name = friendly_name[:_PLAN_FILENAME_MAX_LEN].rsplit(" ", 1)[0].rsplit("_", 1)[0]
     filename = f"{friendly_name} {ts_compact}.md"
 
     # 去重（同名文件追加 _2 _3）/ Deduplicate (append _2 _3 for same-name files)
     plans_dir = output_subdir / "plans"
     plans_dir.mkdir(parents=True, exist_ok=True)
-    base = filename
-    counter = 2
-    while (plans_dir / filename).exists():
-        stem_part = base.rsplit(".md", 1)[0]
-        filename = f"{stem_part}_{counter}.md"
-        counter += 1
+    filename = _deduplicate_filename(plans_dir, filename)
 
     fm_lines = ["---"]
     fm_lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
@@ -646,9 +680,7 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
     version_path = plans_dir / filename
     version_path.write_text(content, encoding="utf-8")
 
-    if stem not in mapping:
-        mapping[stem] = {"current": None, "versions": []}
-    if not isinstance(mapping[stem], dict):
+    if stem not in mapping or not isinstance(mapping.get(stem), dict):
         mapping[stem] = {"current": None, "versions": []}
     mapping[stem]["current"] = filename
     mapping[stem]["versions"].append({
@@ -687,7 +719,8 @@ def _truncate_text(text: str, max_len: int) -> str:
     return _sanitize_text(text)
 
 
-def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, cwd=None, label=None):
+def generate_markdown(messages: list[dict], session_id: str | None, first_ts: str | None, last_ts: str | None,
+                     filepath: Path, topic: str, cwd: str | None = None, label: str | None = None) -> str:
     user_count = sum(1 for m in messages if m.get("role") == "user")
     assistant_count = sum(1 for m in messages if m.get("role") == "assistant")
 
@@ -740,7 +773,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
             lines.append(f"**用户** `{format_timestamp(m['timestamp'])}`")
             text = escape_obsidian_tags(m["text"])
             text = sanitize_markdown_links(text)
-            text = _truncate_text(text, 2000)
+            text = _truncate_text(text, _USER_TEXT_TRUNCATE)
             lines.append(text)
             if m.get("plan_refs"):
                 lines.append("")
@@ -770,7 +803,7 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
                 _render_tools(m["tools"])
 
             if has_text:
-                lines.append(_truncate_text(text, 3000))
+                lines.append(_truncate_text(text, _ASSISTANT_TEXT_TRUNCATE))
 
             if has_plans:
                 lines.append("")
@@ -786,31 +819,20 @@ def generate_markdown(messages, session_id, first_ts, last_ts, filepath, topic, 
 
 def find_existing_output(stem: str, output_subdir: Path) -> Path | None:
     """根据 JSONL stem 找到已存在的输出文件，不存在则返回 None"""
-    mapping_file = output_subdir / ".session_mapping.json"
-    if not mapping_file.exists():
+    mapping = _read_json_file(output_subdir / ".session_mapping.json", {})
+    entry = mapping.get(stem)
+    if entry is None or not isinstance(entry, str):
         return None
-    try:
-        mapping = json.loads(mapping_file.read_text())
-        entry = mapping.get(stem)
-        if entry is None:
-            return None
-        p = output_subdir / entry
-        return p if p.exists() else None
-    except (json.JSONDecodeError, OSError):
-        return None
+    p = output_subdir / entry
+    return p if p.exists() else None
 
 
 def save_mapping(stem: str, filename: str, output_subdir: Path) -> None:
     """记录 JSONL stem → filename 的映射（每个项目子目录独立维护）"""
     mapping_file = output_subdir / ".session_mapping.json"
-    mapping = {}
-    if mapping_file.exists():
-        try:
-            mapping = json.loads(mapping_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
+    mapping = _read_json_file(mapping_file, {})
     mapping[stem] = filename
-    mapping_file.write_text(json.dumps(mapping, ensure_ascii=False, indent=2))
+    _write_json_file(mapping_file, mapping)
 
 
 def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -> str | None:
@@ -836,14 +858,7 @@ def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -
 
     # 生成文件名（纯主题，同名自动加 _2 _3 去重）
     base_filename = f"{topic}.md"
-    filename = base_filename
-    counter = 2
-    while True:
-        candidate = output_subdir / filename
-        if not candidate.exists() or candidate == existing:
-            break
-        filename = f"{topic}_{counter}.md"
-        counter += 1
+    filename = _deduplicate_filename(output_subdir, base_filename, existing)
 
     output_path = output_subdir / filename
 
@@ -863,7 +878,7 @@ def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -
     return f"[{subdir_name}] {filename} (更新)" if is_update else f"[{subdir_name}] {filename}"
 
 
-def main():
+def main() -> None:
     # 确保输出根目录存在
     OBSIDIAN_DIR.mkdir(parents=True, exist_ok=True)
 

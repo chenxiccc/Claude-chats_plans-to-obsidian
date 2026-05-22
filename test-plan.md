@@ -16,7 +16,7 @@
 
 | # | 坑 | 根因 | 修复 | 验证方式 |
 |---|-----|------|------|---------|
-| 6 | AskUserQuestion 回答未提取 | user 消息 `tool_result` 类型未处理 | `_extract_tool_result_text()` 从 `toolUseResult.answers` 提取 | `grep '\[回答\]' output.md` 命中 |
+| 6 | AskUserQuestion 回答未提取 | user 消息 `tool_result` 类型未处理 | `_extract_tool_result_text()` 从 `toolUseResult.answers` 提取 | `grep '\*\*回答\*\*' output.md` 命中 |
 | 7 | ExitPlanMode "tell claude what to do instead" 未提取 | 用户文字在 `toolUseResult` 错误字符串里 | 正则匹配 `"The user provided the following reason for the rejection: "` 提取 | `grep '倾向于' output.md` 命中 |
 | 8 | Bash 输出显示为用户消息 | `tool_result` 通用分支把所有返回值当文本 | 删除通用 fallback，仅处理 AskUserQuestion/ExitPlanMode | `ls` 输出、目录列表不出现在 `**用户**` 后 |
 | 9 | 审批面板输入不构成编辑周期边界 | 只认 `userType=="external"` | 所有非系统注入 user 消息都作边界 | 审批面板回复后 plan 版本正确分界 |
@@ -108,7 +108,7 @@
 | 1 | 无 `<details>` 结构性标签 | 输出用 `> [!note]- 工具调用` callout |
 | 2 | Bash heredoc 无换行断裂 | 命令在单行内，以 `...` 截断 |
 | 3 | AskUserQuestion 问题可见 | `**🤖 倾向哪种方案？**` 后跟选项列表 |
-| 4 | AskUserQuestion 回答可见 | `[回答] 倾向哪种方案？: 方案A` |
+| 4 | AskUserQuestion 回答可见 | `**回答** 倾向哪种方案？: 方案A` |
 | 5 | ExitPlanMode 提案可见 | `**📋 计划提案**` 后跟计划内容 |
 | 6 | 拒绝时的用户文字提取 | `1. 修改方案A的细节 2. 增加容错处理` |
 | 7 | `<details>` 文本不干扰 | 对话文本中 `<details>` 原样显示，不影响 callout |
