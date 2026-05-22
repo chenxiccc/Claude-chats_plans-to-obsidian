@@ -120,6 +120,9 @@ def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
 # 文件名不安全字符（跨平台交集） / Filesystem-unsafe characters (cross-platform intersection)
 _UNSAFE_FILENAME_RE = re.compile(r'[/\\:*?"<>|]')
 
+# 标题中需移除的字符：@ 空格 中英文引号 / Characters to strip from titles: @ space quotes
+_TITLE_STRIP_RE = re.compile(r'[@ \t\'‘’“”（）【】「」《》]')
+
 # ANSI 转义序列（终端颜色码等） / ANSI escape sequences (terminal color codes etc.)
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
@@ -152,8 +155,9 @@ def extract_h1_from_content(content: str) -> str | None:
 
 
 def sanitize_plan_filename(text: str) -> str:
-    """清理文件名中的不安全字符，替换为 _ / Replace filesystem-unsafe chars with _"""
+    """清理文件名中的不安全字符，替换为 _；移除 @ 空格 中英文引号 / Replace unsafe chars with _, strip @ space quotes"""
     text = _UNSAFE_FILENAME_RE.sub("_", text)
+    text = _TITLE_STRIP_RE.sub('', text)
     text = text.strip(". ")
     if not text:
         return "未命名计划"
@@ -285,6 +289,11 @@ def _format_ts(ts_str: str, fmt: str) -> str:
     if dt:
         return dt.strftime(fmt)
     return ts_str[:19] if ts_str else ""
+
+
+def _yaml_quote(value: str) -> str:
+    """YAML 单引号安全引用，内部单引号用 '' 转义 / YAML single-quote a string, escaping internal single quotes"""
+    return "'" + value.replace("'", "''") + "'"
 
 
 def format_frontmatter_datetime(ts_str: str) -> str:
@@ -547,8 +556,9 @@ def extract_topic(messages: list[dict]) -> str:
         if m.get("role") == "user":
             text = m.get("text", "")
             text = text.replace("\n", " ").strip()
-            text = re.sub(r'[#*_`~>\[\]!|\\]', '', text).strip()
+            text = re.sub(r'[#*_`~>\[\]!|\\^]', '', text).strip()
             text = re.sub(r'[/\\:*?"<>|]', '', text)
+            text = _TITLE_STRIP_RE.sub('', text)
             # East Asian Width 截断：CJK/全角计 2，ASCII 计 1，累计 ≤ 40
             width = 0
             result = []
@@ -710,7 +720,7 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
     fm_lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
     fm_lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
     if cwd:
-        fm_lines.append(f"cwd: '{cwd}'")
+        fm_lines.append(f"cwd: {_yaml_quote(cwd)}")
     fm_lines.append(f"ref_plan_file: {stem}.md")
     fm_lines.append("---")
     fm_lines.append("")
@@ -769,9 +779,9 @@ def generate_markdown(messages: list[dict], session_id: str | None, first_ts: st
     lines.append(f"created: {format_frontmatter_datetime(first_ts)}")
     lines.append(f"modified: {format_frontmatter_datetime(last_ts)}")
     if cwd:
-        lines.append(f"cwd: '{cwd}'")
+        lines.append(f"cwd: {_yaml_quote(cwd)}")
     if label:
-        lines.append(f"label: {label}")
+        lines.append(f"label: {_yaml_quote(label)}")
     lines.append("---")
     lines.append(f"> 时间：{format_datetime(first_ts)} ~ {format_datetime(last_ts)}")
     lines.append(f"> 轮数：用户 {user_count} 轮，Claude {assistant_count} 轮")
