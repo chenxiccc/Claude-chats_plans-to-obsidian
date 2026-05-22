@@ -24,6 +24,7 @@ TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", Path.home() / ".claude"
 
 DISPLAY_TZ = timezone(timedelta(hours=8))
 PLANS_SOURCE_DIR = Path.home() / ".claude" / "plans"
+_VSCODE_LABEL_CACHE = Path.home() / ".claude" / ".vscode_labels_cache.json"
 
 # 截断与限制常量 / Truncation and limit constants
 _MAX_CWD_SCAN_LINES = 100
@@ -194,8 +195,70 @@ def save_plan_mapping(output_subdir: Path, mapping: dict) -> None:
     _plan_mapping_cache[str(output_subdir)] = mapping
 
 
-# VS Code 会话标签缓存（首次调用时构建）
+# VS Code 会话标签缓存（首次调用时从磁盘加载） / Cached VS Code session labels (loaded from disk on first call)
 _vscode_labels: dict[str, str] | None = None
+
+
+def _scan_workspace_labels(ws_dir: Path, labels: dict[str, str]) -> None:
+    """扫描单个 workspace 的 state.vscdb，提取 sessionId → label / Scan one workspace's state.vscdb for claude-code labels"""
+    db = ws_dir / "state.vscdb"
+    if not db.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(db))
+        rows = conn.execute(
+            "SELECT value FROM ItemTable WHERE value LIKE '%claude-code%'"
+        ).fetchall()
+        conn.close()
+        for (value,) in rows:
+            try:
+                entries = json.loads(value)
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if isinstance(entry, dict) and entry.get("providerType") == "claude-code":
+                            resource = entry.get("resource", "")
+                            label = entry.get("label", "")
+                            if resource.startswith("claude-code:/"):
+                                sid = resource.split("claude-code:/")[-1]
+                                if sid and sid not in labels:
+                                    labels[sid] = label
+            except json.JSONDecodeError:
+                pass
+    except (json.JSONDecodeError, sqlite3.Error):
+        pass
+
+
+def _load_vscode_labels() -> dict[str, str]:
+    """从磁盘缓存加载 VS Code 标签索引，仅增量扫描新 workspace / Load label index from disk cache, incrementally scan new workspaces only"""
+    cache = _read_json_file(_VSCODE_LABEL_CACHE, {})
+    labels: dict[str, str] = cache.get("labels", {}) if isinstance(cache, dict) else {}
+    indexed_dirs: set[str] = set(cache.get("indexed_dirs", [])) if isinstance(cache, dict) else set()
+
+    ws_base = _get_vscode_workspace_path()
+    if not ws_base.exists():
+        return labels
+
+    # 收集当前所有含 state.vscdb 的 workspace 目录名 / Collect all workspace dirs with state.vscdb
+    current_dirs: set[str] = set()
+    for wsdir in ws_base.iterdir():
+        if wsdir.is_dir() and (wsdir / "state.vscdb").exists():
+            current_dirs.add(wsdir.name)
+
+    # 增量扫描新 workspace / Incremental scan for new workspaces
+    new_dirs = current_dirs - indexed_dirs
+    if new_dirs:
+        for dirname in new_dirs:
+            _scan_workspace_labels(ws_base / dirname, labels)
+        # 写回磁盘 / Write back to disk
+        cache_data = {"labels": labels, "indexed_dirs": sorted(current_dirs)}
+        try:
+            tmp = _VSCODE_LABEL_CACHE.with_suffix(_VSCODE_LABEL_CACHE.suffix + ".tmp")
+            tmp.write_text(json.dumps(cache_data, ensure_ascii=False, indent=2))
+            os.replace(tmp, _VSCODE_LABEL_CACHE)
+        except OSError:
+            pass  # 写入失败不影响主流程 / write failure is non-fatal
+
+    return labels
 
 
 def _get_vscode_workspace_path() -> Path:
@@ -206,48 +269,13 @@ def _get_vscode_workspace_path() -> Path:
         return Path.home() / "Library/Application Support/Code/User/workspaceStorage"
 
 
-def build_vscode_label_index() -> dict[str, str]:
-    """扫描所有 VS Code workspace state.vscdb，构建 sessionId → label 索引"""
-    index: dict[str, str] = {}
-    ws_base = _get_vscode_workspace_path()
-    if not ws_base.exists():
-        return index
-    for wsdir in ws_base.iterdir():
-        db = wsdir / "state.vscdb"
-        if not db.exists():
-            continue
-        try:
-            conn = sqlite3.connect(str(db))
-            rows = conn.execute(
-                "SELECT value FROM ItemTable WHERE value LIKE '%claude-code%'"
-            ).fetchall()
-            conn.close()
-            for (value,) in rows:
-                try:
-                    entries = json.loads(value)
-                    if isinstance(entries, list):
-                        for entry in entries:
-                            if isinstance(entry, dict) and entry.get("providerType") == "claude-code":
-                                resource = entry.get("resource", "")
-                                label = entry.get("label", "")
-                                if resource.startswith("claude-code:/"):
-                                    sid = resource.split("claude-code:/")[-1]
-                                    if sid and sid not in index:
-                                        index[sid] = label
-                except json.JSONDecodeError:
-                    pass
-        except (json.JSONDecodeError, sqlite3.Error):
-            continue
-    return index
-
-
 def find_session_name(session_id: str) -> str | None:
-    """从 VS Code workspace state.vscdb 查找会话标签（持久化存储）"""
+    """从 VS Code workspace state.vscdb 查找会话标签，结果持久化缓存 / Look up session label from VS Code workspace, with persistent cache"""
     global _vscode_labels
     if not session_id:
         return None
     if _vscode_labels is None:
-        _vscode_labels = build_vscode_label_index()
+        _vscode_labels = _load_vscode_labels()
     return _vscode_labels.get(session_id)
 
 
