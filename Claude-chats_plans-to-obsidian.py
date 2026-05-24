@@ -24,7 +24,9 @@ TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", Path.home() / ".claude"
 
 DISPLAY_TZ = timezone(timedelta(hours=8))
 PLANS_SOURCE_DIR = Path.home() / ".claude" / "plans"
-_VSCODE_LABEL_CACHE = Path.home() / ".claude" / ".vscode_labels_cache.json"
+_CACHE_DIR = Path.home() / ".claude" / "claude_to_obsidian"
+_CWD_MAPPING_FILE = _CACHE_DIR / ".cwd_mapping.json"
+_VSCODE_LABEL_CACHE = _CACHE_DIR / ".vscode_labels_cache.json"
 
 # 截断与限制常量 / Truncation and limit constants
 _MAX_CWD_SCAN_LINES = 100
@@ -108,13 +110,14 @@ def _write_json_file(filepath: Path, data) -> None:
 def load_cwd_mapping() -> dict[str, str]:
     """读取 cwd → folder_name 映射 / Load cwd → folder_name mapping"""
     # 文件存储为 {folder_name: cwd}，反转为 {cwd: folder_name} 便于查询 / File stores {folder_name: cwd}, invert for O(1) lookup
-    raw = _read_json_file(OBSIDIAN_DIR / ".cwd_mapping.json", {})
+    raw = _read_json_file(_CWD_MAPPING_FILE, {})
     return {cwd: name for name, cwd in raw.items()}
 
 
 def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
     """全量写入 {folder_name: cwd} 映射 / Full rewrite of folder_name → cwd mapping"""
-    _write_json_file(OBSIDIAN_DIR / ".cwd_mapping.json", name_to_cwd)
+    _CWD_MAPPING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_file(_CWD_MAPPING_FILE, name_to_cwd)
 
 
 # 文件名不安全字符（跨平台交集） / Filesystem-unsafe characters (cross-platform intersection)
@@ -256,6 +259,7 @@ def _load_vscode_labels() -> dict[str, str]:
         # 写回磁盘 / Write back to disk
         cache_data = {"labels": labels, "indexed_dirs": sorted(current_dirs)}
         try:
+            _VSCODE_LABEL_CACHE.parent.mkdir(parents=True, exist_ok=True)
             tmp = _VSCODE_LABEL_CACHE.with_suffix(_VSCODE_LABEL_CACHE.suffix + ".tmp")
             tmp.write_text(json.dumps(cache_data, ensure_ascii=False, indent=2))
             os.replace(tmp, _VSCODE_LABEL_CACHE)
