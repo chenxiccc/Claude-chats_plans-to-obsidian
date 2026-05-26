@@ -14,6 +14,7 @@ import os
 import sqlite3
 import sys
 import re
+import shutil
 import unicodedata
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -155,6 +156,13 @@ def extract_h1_from_content(content: str) -> str | None:
     if first_line.startswith("# "):
         return first_line[2:].strip()
     return None
+
+
+def _normalize_h1(h1: str) -> str:
+    """规范化 H1 标题用于比较：trim + Unicode NFC / Normalize H1 for comparison: trim + NFC"""
+    if not h1:
+        return ""
+    return unicodedata.normalize("NFC", h1.strip())
 
 
 def sanitize_plan_filename(text: str) -> str:
@@ -603,13 +611,13 @@ def sanitize_markdown_links(text: str) -> str:
 
 def build_plan_versions(plan_writes: list[dict], messages: list[dict],
                         output_subdir: Path,
-                        cwd: str | None = None) -> dict[str, list[tuple[str, str, str]]]:
+                        cwd: str | None = None) -> tuple[dict[str, list[tuple[str, str, str]]], list[str]]:
     """按用户消息边界将 plan_writes 分组为编辑周期，创建版本文件，更新 .plan_mapping.json。
-    返回: {stem: [(start_ts, end_ts, version_filename), ...]} 时间线
+    返回: (timeline, final_plans)
     Group plan writes into edit cycles by user-message boundaries, create version files,
-    update .plan_mapping.json. Returns timeline dict."""
+    update .plan_mapping.json. Returns (timeline, final_plans)."""
     if not plan_writes:
-        return {}
+        return ({}, [])
 
     # 收集所有用户消息时间戳作为周期边界 / Collect all user message timestamps as cycle boundaries
     user_ts_list: list[str] = []
@@ -655,8 +663,12 @@ def build_plan_versions(plan_writes: list[dict], messages: list[dict],
 
         timeline[stem] = cycles
 
+    # 统一判定 draft 状态并同步文件系统 / Finalize draft status and sync filesystem
+    touched_stems = set(by_stem.keys())
+    final_plans = _finalize_plan_versions(mapping, output_subdir, touched_stems)
+
     save_plan_mapping(output_subdir, mapping)
-    return timeline
+    return (timeline, final_plans)
 
 
 def _has_user_boundary_between(ts1: str, ts2: str, user_ts_list: list[str]) -> bool:
@@ -740,7 +752,64 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
         "name": filename,
         "hash": content_hash,
         "ts": last["timestamp"],
+        "h1": h1,
     })
+
+
+def _finalize_plan_versions(mapping: dict, output_subdir: Path,
+                            touched_stems: set[str]) -> list[str]:
+    """按 stem+H1 分组，标记 draft 状态，移动文件，返回 final_plans 列表。
+    直接修改 mapping dict，调用方负责持久化。
+    Group versions by stem+H1, mark draft status, move files, return final_plans list.
+    Mutates mapping dict in place; caller is responsible for persisting."""
+    plans_dir = output_subdir / "plans"
+    draft_dir = plans_dir / "draft_plans"
+
+    # 步骤 4a：计算 draft 状态 / Compute draft status
+    for stem, entry in mapping.items():
+        versions = entry.get("versions")
+        if not isinstance(versions, list) or not versions:
+            continue
+
+        # 按归一化 H1 分组 / Group by normalized H1
+        by_h1: dict[str, list[dict]] = {}
+        for v in versions:
+            h1_key = _normalize_h1(v.get("h1", ""))
+            # 空 H1 每个版本独立分组，避免被误判为同一计划 / Empty H1: each version is its own group
+            if h1_key == "":
+                v["draft"] = False
+                continue
+            by_h1.setdefault(h1_key, []).append(v)
+
+        # 每组内最新为非 draft，其余为 draft / Latest in each group is non-draft, rest are draft
+        for h1_key, group in by_h1.items():
+            group.sort(key=lambda v: v.get("ts", ""))
+            for v in group[:-1]:
+                v["draft"] = True
+            group[-1]["draft"] = False
+
+    # 步骤 4b：同步文件系统（仅降级）/ Sync filesystem (demotion only)
+    for entry in mapping.values():
+        for v in entry.get("versions", []):
+            if v.get("draft", False):
+                src = plans_dir / v["name"]
+                if src.exists():
+                    draft_dir.mkdir(parents=True, exist_ok=True)
+                    new_name = _deduplicate_filename(draft_dir, v["name"])
+                    shutil.move(str(src), str(draft_dir / new_name))
+                    if new_name != v["name"]:
+                        v["name"] = new_name
+
+    # 步骤 4c：收集 final_plans（仅 touched stems）/ Collect final_plans (touched stems only)
+    final_plans: list[str] = []
+    for stem in touched_stems:
+        entry = mapping.get(stem)
+        if entry:
+            for v in entry.get("versions", []):
+                if not v.get("draft", False):
+                    final_plans.append(v["name"])
+    final_plans.sort()
+    return final_plans
 
 
 def resolve_plan_refs_from_timeline(messages: list[dict],
@@ -760,7 +829,7 @@ def resolve_plan_refs_from_timeline(messages: list[dict],
                     active = filename
                     break
             if active:
-                refs.append(f"[[plans/{active}]]")
+                refs.append(f"[[{active}]]")
         if refs:
             m["plan_refs"] = refs
 
@@ -773,7 +842,8 @@ def _truncate_text(text: str, max_len: int) -> str:
 
 
 def generate_markdown(messages: list[dict], session_id: str | None, first_ts: str | None, last_ts: str | None,
-                     filepath: Path, topic: str, cwd: str | None = None, label: str | None = None) -> str:
+                     filepath: Path, topic: str, cwd: str | None = None, label: str | None = None,
+                     final_plans: list[str] | None = None) -> str:
     user_count = sum(1 for m in messages if m.get("role") == "user")
     assistant_count = sum(1 for m in messages if m.get("role") == "assistant")
 
@@ -786,6 +856,10 @@ def generate_markdown(messages: list[dict], session_id: str | None, first_ts: st
         lines.append(f"cwd: {_yaml_quote(cwd)}")
     if label:
         lines.append(f"label: {_yaml_quote(label)}")
+    if final_plans:
+        lines.append("final_plans:")
+        for fn in final_plans:
+            lines.append(f"  - {_yaml_quote(f'[[{fn}]]')}")
     lines.append("---")
     lines.append(f"> 时间：{format_datetime(first_ts)} ~ {format_datetime(last_ts)}")
     lines.append(f"> 轮数：用户 {user_count} 轮，Claude {assistant_count} 轮")
@@ -902,7 +976,7 @@ def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -
         return None
 
     # 构建 plan 版本时间线并创建版本文件 / Build plan version timeline and create version files
-    plan_timeline = build_plan_versions(plan_writes, messages, output_subdir, cwd)
+    plan_timeline, final_plans = build_plan_versions(plan_writes, messages, output_subdir, cwd)
 
     # 按消息时间戳匹配活跃 plan 版本 / Match active plan versions per message timestamp
     resolve_plan_refs_from_timeline(messages, plan_timeline)
@@ -922,7 +996,8 @@ def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -
     # 获取 VS Code 标签（仅写入 frontmatter 元数据，不做标题）
     label = find_session_name(session_id)
 
-    md = generate_markdown(messages, session_id, first_ts, last_ts, transcript, topic, cwd, label)
+    md = generate_markdown(messages, session_id, first_ts, last_ts, transcript, topic, cwd, label,
+                           final_plans=final_plans)
     output_path.write_text(md, encoding="utf-8")
     save_mapping(transcript.stem, filename, output_subdir)
 

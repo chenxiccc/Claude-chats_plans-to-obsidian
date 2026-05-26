@@ -36,6 +36,9 @@ TEST_MESSAGES = [
     {"type":"user","userType":"external","message":{"content":[{"type":"tool_result","content":"total 168\ndrwxr-xr-x 14 admin staff 448 May 12 11:56 ."}]},"timestamp":"2026-05-21T10:02:01Z"},
     # 重写同一 plan 文件（新编辑周期，应生成新的 plan 版本）
     {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":f"/Users/admin/.claude/plans/{TEST_STEM}.md","content":"# 新增用户权限管理\n\n## Context\n\n需要加权限系统"}}]},"timestamp":"2026-05-21T10:03:00Z"},
+    # 再次修改同一 plan，H1 与第一个版本相同（应触发 draft 逻辑） / Edit same plan with same H1 as first version (should trigger draft logic)
+    {"type":"user","userType":"external","message":{"content":[{"type":"text","text":"继续修改"}]},"timestamp":"2026-05-21T10:04:00Z"},
+    {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":f"/Users/admin/.claude/plans/{TEST_STEM}.md","content":"# 测试计划：修复登录页\n\n## Context\n\n改进后的修复方案"}}]},"timestamp":"2026-05-21T10:05:00Z"},
 ]
 
 failed = 0
@@ -121,23 +124,55 @@ check("#tag 被转义", "\\#tag1" in output)
 print("\n=== Plan 版本管理 ===")
 plan_mapping_file = plans_dir / ".plan_mapping.json" if plans_dir else None
 check(".plan_mapping.json 存在", plan_mapping_file and plan_mapping_file.exists())
+draft_dir = plans_dir / "draft_plans" if plans_dir else None
+
 if plan_mapping_file and plan_mapping_file.exists():
     mapping = json.loads(plan_mapping_file.read_text())
     stem_entry = mapping.get(TEST_STEM, {})
     versions = stem_entry.get("versions", [])
-    check("同 stem 两次写入生成 2 个版本", len(versions) == 2)
-    if len(versions) >= 2:
-        check("版本 1 用户名含'修复登录页'", "修复登录页" in versions[0]["name"])
-        check("版本 2 用户名含'新增用户权限管理'", "新增用户权限管理" in versions[1]["name"])
+    check("同 stem 三次写入生成 3 个版本", len(versions) == 3)
+    # 检查 h1 和 draft 字段 / Check h1 and draft fields
+    h1s = [v.get("h1", "") for v in versions]
+    check("版本条目包含 h1 字段", all(v.get("h1") is not None for v in versions))
+    check("版本条目包含 draft 字段", all("draft" in v for v in versions))
+    # 同 H1 组：第一个"测试计划：修复登录页"应为 draft，最新为非 draft / Same H1 group: first should be draft, latest non-draft
+    login_versions = [v for v in versions if "修复登录页" in v.get("h1", "")]
+    check("两个'修复登录页'版本中一个 draft 一个非 draft",
+          sum(1 for v in login_versions if v.get("draft")) == 1 and
+          sum(1 for v in login_versions if not v.get("draft")) == 1)
+    # 不同 H1：应独立为非 draft / Different H1: should be independent non-draft
+    perm_versions = [v for v in versions if "新增用户权限管理" in v.get("h1", "")]
+    check("'新增用户权限管理'版本为非 draft",
+          len(perm_versions) == 1 and not perm_versions[0].get("draft"))
+    # 文件位置 / File locations
+    check("draft_plans 目录存在", draft_dir and draft_dir.exists())
+    if draft_dir and draft_dir.exists():
+        draft_files = list(draft_dir.glob("*.md"))
+        check("draft_plans 中有 1 个文件", len(draft_files) == 1)
+        if draft_files:
+            check("draft 文件名含'修复登录页'", "修复登录页" in draft_files[0].name)
+    # plans 根目录应有 2 个文件（不同 H1 的最新版） / plans root should have 2 files (latest of each H1)
+    root_plans = [f for f in plans_dir.glob("*.md")]
+    check("plans 根目录有 2 个文件", len(root_plans) == 2)
 
 # ===== Frontmatter =====
 print("\n=== Frontmatter ===")
 check("Session created 字段", "created:" in output.split("---\n")[1])
 check("Session modified 字段", "modified:" in output.split("---\n")[1])
+check("Session final_plans 字段", "final_plans:" in output.split("---\n")[1])
 if plan_files:
     plan_content = plan_files[0].read_text(encoding="utf-8")
     check("Plan created 字段", "created:" in plan_content.split("---\n")[1])
     check("Plan ref_plan_file 字段", "ref_plan_file:" in plan_content.split("---\n")[1])
+
+# ===== final_plans 前端元数据 =====
+print("\n=== final_plans ===")
+# final_plans 应包含 2 个最终版 wikilink：不同 H1 各一个 / Should have 2 final wikilinks: one per distinct H1
+check("final_plans 含 2 个条目", output.count("  - '[[") == 2)
+check("final_plans 含'修复登录页'", "修复登录页" in output.split("final_plans:")[1].split("---")[0])
+check("final_plans 含'新增用户权限管理'", "新增用户权限管理" in output.split("final_plans:")[1].split("---")[0])
+# wikilink 格式为 [[filename.md]] 无路径 / Wikilink format [[filename.md]] without path
+check("plan_refs 使用 [[filename]] 无路径格式", "[[plans/" not in output and "[[" in output)
 
 # 清理 / Cleanup
 shutil.rmtree(test_dir)
