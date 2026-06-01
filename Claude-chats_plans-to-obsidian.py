@@ -125,7 +125,7 @@ def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
 _UNSAFE_FILENAME_RE = re.compile(r'[/\\:*?"<>|]')
 
 # 标题中需移除的字符：@ 空格 中英文引号 / Characters to strip from titles: @ space quotes
-_TITLE_STRIP_RE = re.compile(r'[@ \t\'‘’“”（）【】「」《》]')
+_TITLE_STRIP_RE = re.compile(r'[@ \t\'‘’“”（）【】「」《》#]')
 
 # ANSI 转义序列（终端颜色码等） / ANSI escape sequences (terminal color codes etc.)
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
@@ -594,10 +594,25 @@ def format_datetime(ts_str: str) -> str:
 
 
 def escape_obsidian_tags(text: str) -> str:
-    """转义特殊字符防止 Obsidian 误解析 / Escape special characters to prevent Obsidian misparsing"""
-    # 转义 # 号防止误识别为标签 / Escape # to prevent tag recognition
-    text = re.sub(r'(^|\W)#(?=[\w぀-ゟ゠-ヿ가-힯一-鿿])', r'\1\\#', text)
-    return text
+    """转义 # 号防止 Obsidian 误识别为标签 / Escape # to prevent Obsidian tag recognition
+
+    使用 unicodedata.category() 判断 # 后的字符是否为合法 tag 首字符 ——
+    自动覆盖全部 Unicode 字母系统，避免手写 range 遗漏。
+    Uses unicodedata.category() to determine if the character after # is a valid
+    tag start — automatically covers all Unicode letter systems."""
+    def _replacer(m: re.Match) -> str:
+        prefix = m.group(1)          # 捕获 (^|\\W) / Captured prefix
+        if prefix.endswith('\\'):    # 已转义为 \\#，跳过避免双反斜杠 / Already escaped, skip to avoid double-escaping
+            return m.group(0)
+        following = m.group(2)       # # 后的首个非空白字符 / First non-whitespace char after #
+        cat = unicodedata.category(following)
+        # Obsidian tag 合法首字符: Unicode 字母 (L*) / 数字 (N*) / _ / - / /
+        # Valid Obsidian tag start chars: Unicode letters, numbers, underscore, hyphen, slash
+        if cat.startswith('L') or cat.startswith('N') or following in '_-/':
+            return prefix + '\\#' + following
+        return m.group(0)            # 非 tag 首字符 → 原样保留 / Not a tag start → leave unchanged
+
+    return re.sub(r'(^|\W)#(\S)', _replacer, text)
 
 
 def sanitize_markdown_links(text: str) -> str:
@@ -710,6 +725,10 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
 
     if not content or not h1:
         return
+
+    # Obsidian 输出清理：转义 #tag 和去除 [text](url) 链接格式 / Apply Obsidian-safe escaping
+    content = escape_obsidian_tags(content)
+    content = sanitize_markdown_links(content)
 
     content_hash = hashlib.sha256(content.encode()).hexdigest()[:_HASH_TRUNCATE_LEN]
 

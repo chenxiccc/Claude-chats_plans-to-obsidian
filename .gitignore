@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-app.js
 CLAUDE.md
 .claude
 .DS_Store
+docs/
+docs
