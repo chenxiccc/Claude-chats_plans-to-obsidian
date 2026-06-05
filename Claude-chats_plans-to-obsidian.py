@@ -26,7 +26,7 @@ TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", Path.home() / ".claude"
 DISPLAY_TZ = timezone(timedelta(hours=8))
 PLANS_SOURCE_DIR = Path.home() / ".claude" / "plans"
 _CACHE_DIR = Path.home() / ".claude" / "claude_to_obsidian"
-_CWD_MAPPING_FILE = _CACHE_DIR / ".cwd_mapping.json"
+_CWD_MAPPING_FILE = _CACHE_DIR / "cwd_mapping.json"
 _VSCODE_LABEL_CACHE = _CACHE_DIR / ".vscode_labels_cache.json"
 
 # 截断与限制常量 / Truncation and limit constants
@@ -196,7 +196,7 @@ def load_plan_mapping(output_subdir: Path) -> dict[str, dict]:
     cache_key = str(output_subdir)
     if cache_key in _plan_mapping_cache:
         return _plan_mapping_cache[cache_key]
-    mapping = _read_json_file(output_subdir / "plans" / ".plan_mapping.json", {})
+    mapping = _read_json_file(output_subdir / "plans" / "plan_mapping.json", {})
     _plan_mapping_cache[cache_key] = mapping
     return mapping
 
@@ -205,7 +205,7 @@ def save_plan_mapping(output_subdir: Path, mapping: dict) -> None:
     """持久化项目 plan 映射 / Persist per-project plan mapping"""
     plans_dir = output_subdir / "plans"
     plans_dir.mkdir(parents=True, exist_ok=True)
-    _write_json_file(plans_dir / ".plan_mapping.json", mapping)
+    _write_json_file(plans_dir / "plan_mapping.json", mapping)
     # 写入成功后更新缓存 / Update cache only after successful write
     _plan_mapping_cache[str(output_subdir)] = mapping
 
@@ -964,18 +964,32 @@ def generate_markdown(messages: list[dict], session_id: str | None, first_ts: st
 
 
 def find_existing_output(stem: str, output_subdir: Path) -> Path | None:
-    """根据 JSONL stem 找到已存在的输出文件，不存在则返回 None"""
-    mapping = _read_json_file(output_subdir / ".session_mapping.json", {})
+    """根据 JSONL stem 找到已存在的输出文件，不存在则返回 None / Find existing output file by JSONL stem, with disk fallback"""
+    mapping = _read_json_file(output_subdir / "session_mapping.json", {})
     entry = mapping.get(stem)
-    if entry is None or not isinstance(entry, str):
-        return None
-    p = output_subdir / entry
-    return p if p.exists() else None
+    if entry is not None and isinstance(entry, str):
+        p = output_subdir / entry
+        if p.exists():
+            return p
+
+    # Fallback：mapping 丢失时从磁盘 .md 文件反向匹配 session ID / Scan .md files for matching session ID
+    session_marker = f"> Session：`{stem}`"
+    for f in output_subdir.glob("*.md"):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                head = "".join(fh.readline() for _ in range(20))
+            if session_marker in head:
+                # 找到匹配文件，补登记 mapping / Found match, update mapping
+                save_mapping(stem, f.name, output_subdir)
+                return f
+        except OSError:
+            continue
+    return None
 
 
 def save_mapping(stem: str, filename: str, output_subdir: Path) -> None:
     """记录 JSONL stem → filename 的映射（每个项目子目录独立维护）"""
-    mapping_file = output_subdir / ".session_mapping.json"
+    mapping_file = output_subdir / "session_mapping.json"
     mapping = _read_json_file(mapping_file, {})
     mapping[stem] = filename
     _write_json_file(mapping_file, mapping)

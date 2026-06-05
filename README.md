@@ -167,9 +167,9 @@ python3 ~/.claude/scripts/hooks/Claude-chats_plans-to-obsidian.py --scan-all
 ```
 ~/Obsidian/Project/claude/session/
 ├── Claude-chats_plans-to-obsidian/
-│   ├── .session_mapping.json
+│   ├── session_mapping.json
 │   ├── plans/
-│   │   ├── .plan_mapping.json
+│   │   ├── plan_mapping.json
 │   │   ├── draft_plans/
 │   │   │   └── 修复登录页bug 20260521-120000.md
 │   │   ├── 修复登录页bug 20260521-143000.md
@@ -177,13 +177,13 @@ python3 ~/.claude/scripts/hooks/Claude-chats_plans-to-obsidian.py --scan-all
 │   ├── 探讨plans文件如何同步到Obsidian.md
 │   └── 修复会话标题提取逻辑.md
 └── fns/
-    ├── .session_mapping.json
+    ├── session_mapping.json
     ├── plans/
     │   └── ...
     └── ...
 ```
 
-> `.cwd_mapping.json` 已迁移至 `~/.claude/claude_to_obsidian/`（缓存目录集中管理）
+> `cwd_mapping.json` 已迁移至 `~/.claude/claude_to_obsidian/`（缓存目录集中管理）
 
 ### 工作原理
 
