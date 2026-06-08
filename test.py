@@ -73,6 +73,16 @@ script = Path(__file__).parent / "Claude-chats_plans-to-obsidian.py"
 env = os.environ.copy()
 env["OBSIDIAN_DIR"] = str(obsidian_dir)
 env["TRANSCRIPTS_DIR"] = str(test_dir / "transcripts")
+
+# 清理真实缓存中可能干扰测试的残留数据 / Clear real cache entries that could interfere with test
+_cache_root = Path.home() / ".claude" / "claude_to_obsidian"
+for _sub in ["session_mappings", "plan_mappings"]:
+    _cf = _cache_root / _sub / "project.json"
+    if _cf.exists():
+        _cf.unlink()
+_cwd_cache = _cache_root / "cwd_mapping.json"
+if _cwd_cache.exists():
+    _cwd_cache.unlink()
 result = subprocess.run([sys.executable, str(script), "--scan-all"],
                        capture_output=True, text=True, timeout=30, env=env)
 if result.returncode != 0:

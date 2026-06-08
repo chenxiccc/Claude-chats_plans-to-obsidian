@@ -18,12 +18,33 @@ import shutil
 import unicodedata
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from dataclasses import dataclass
+
+
+@dataclass
+class ParseResult:
+    """parse_transcript() 返回的结构化结果 / Structured result from parse_transcript()"""
+    messages: list[dict]
+    session_id: str | None
+    first_ts: str | None
+    last_ts: str | None
+    plan_writes: list[dict]
+    user_boundary_indices: list[int]  # 用户消息在 messages 中的索引，供 build_plan_versions 使用 / indices of user messages for build_plan_versions
+
+
+@dataclass
+class ProcessResult:
+    """process_one() 返回的结构化结果 / Structured result from process_one()"""
+    filename: str
+    is_update: bool
+    skipped: bool = False
+
 
 # ===== 配置 =====
 OBSIDIAN_DIR = Path(os.environ.get("OBSIDIAN_DIR", Path.home() / "Obsidian" / "Project" / "claude" / "session"))
 TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", Path.home() / ".claude" / "projects"))
 
-DISPLAY_TZ = timezone(timedelta(hours=8))
+DISPLAY_TZ = timezone(timedelta(hours=int(os.environ.get("DISPLAY_TZ_OFFSET", "8"))))
 PLANS_SOURCE_DIR = Path.home() / ".claude" / "plans"
 _CACHE_DIR = Path.home() / ".claude" / "claude_to_obsidian"
 
@@ -147,8 +168,25 @@ _SKIP_PREFIXES = (
     "[Request interrupted by user",
 )
 
+# 各函数共用的预编译正则，避免每次调用重复编译 / Shared precompiled regexes to avoid recompilation on every call
+_RE_FENCES = re.compile(r'^ {0,3}```', re.MULTILINE)
+_RE_TRAILING_FENCE = re.compile(r' {0,3}```\S+$')
+_RE_OBSIDIAN_TAG = re.compile(r'(^|\W)#(\S)')
+_RE_MD_LINK = re.compile(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)')
+_RE_BARE_MD_LINK = re.compile(r'(?<!\[)\[([^\]]+)\](?!\])')
+_RE_MARKDOWN_STYLING = re.compile(r'[*_`~>\[\]!|\\^]')  # extract_topic 用 / used by extract_topic
+
 # plan 映射缓存（按输出目录缓存） / Plan mapping cache (keyed by output directory)
 _plan_mapping_cache: dict[str, dict] = {}
+# plan 哈希索引，加速版本去重查找 / Plan hash index for fast version dedup lookup
+# {cache_key: {stem: {content_hash: filename}}}
+_plan_hash_index: dict[str, dict[str, dict[str, str]]] = {}
+
+
+def reset_plan_caches() -> None:
+    """仅用于测试：清空 plan 内存缓存，防止跨测试泄漏 / Test-only: clear plan in-memory caches to avoid cross-test leakage"""
+    _plan_mapping_cache.clear()
+    _plan_hash_index.clear()
 
 
 def extract_h1_from_content(content: str) -> str | None:
@@ -195,13 +233,28 @@ def format_timestamp_for_filename(ts_str: str) -> str:
 
 
 def load_plan_mapping(output_subdir: Path) -> dict[str, dict]:
-    """加载项目 plan 映射缓存（本地缓存目录，不参与 Obsidian 同步） / Load per-project plan mapping from local cache"""
+    """加载项目 plan 映射缓存，同时构建哈希索引加速版本去重 / Load per-project plan mapping, build hash index for fast dedup"""
     cache_key = str(output_subdir)
     if cache_key in _plan_mapping_cache:
         return _plan_mapping_cache[cache_key]
     (_CACHE_DIR / "plan_mappings").mkdir(parents=True, exist_ok=True)
     mapping = _read_json_file(_CACHE_DIR / "plan_mappings" / f"{_cache_key(output_subdir)}.json", {})
     _plan_mapping_cache[cache_key] = mapping
+    # 构建 {stem: {hash: filename}} 二级索引 / Build {stem: {hash: filename}} secondary index
+    hi: dict[str, dict[str, str]] = {}
+    for stem, entry in mapping.items():
+        if isinstance(entry, dict):
+            versions = entry.get("versions")
+            if isinstance(versions, list):
+                inner: dict[str, str] = {}
+                for v in versions:
+                    h = v.get("hash")
+                    n = v.get("name")
+                    if h and n:
+                        inner[h] = n
+                if inner:
+                    hi[stem] = inner
+    _plan_hash_index[cache_key] = hi
     return mapping
 
 
@@ -209,12 +262,34 @@ def save_plan_mapping(output_subdir: Path, mapping: dict) -> None:
     """持久化项目 plan 映射到本地缓存 / Persist per-project plan mapping to local cache"""
     (_CACHE_DIR / "plan_mappings").mkdir(parents=True, exist_ok=True)
     _write_json_file(_CACHE_DIR / "plan_mappings" / f"{_cache_key(output_subdir)}.json", mapping)
-    # 写入成功后更新缓存 / Update cache only after successful write
-    _plan_mapping_cache[str(output_subdir)] = mapping
+    cache_key = str(output_subdir)
+    # 写入成功后更新缓存 / Update caches only after successful write
+    _plan_mapping_cache[cache_key] = mapping
+    # 重建哈希索引 / Rebuild hash index
+    hi: dict[str, dict[str, str]] = {}
+    for stem, entry in mapping.items():
+        if isinstance(entry, dict):
+            versions = entry.get("versions")
+            if isinstance(versions, list):
+                inner: dict[str, str] = {}
+                for v in versions:
+                    h = v.get("hash")
+                    n = v.get("name")
+                    if h and n:
+                        inner[h] = n
+                if inner:
+                    hi[stem] = inner
+    _plan_hash_index[cache_key] = hi
 
 
 # VS Code 会话标签缓存（首次调用时从磁盘加载） / Cached VS Code session labels (loaded from disk on first call)
 _vscode_labels: dict[str, str] | None = None
+
+
+def reset_vscode_labels() -> None:
+    """仅用于测试：清空 VS Code 标签缓存 / Test-only: clear VS Code labels cache"""
+    global _vscode_labels
+    _vscode_labels = None
 
 
 def _scan_workspace_labels(ws_dir: Path, labels: dict[str, str]) -> None:
@@ -357,13 +432,13 @@ def _sanitize_text(text: str) -> str:
     text = _ANSI_ESCAPE_RE.sub('', text)
     # 闭合未关闭的代码围栏，防止后续内容被吞入代码块
     # Close unclosed code fences (CommonMark: up to 3 spaces indent, then 3+ backticks)
-    fences = re.findall(r'^ {0,3}```', text, re.MULTILINE)
+    fences = _RE_FENCES.findall(text)
     if len(fences) % 2 != 0:
         lines = text.split('\n')
         # 移除末尾空白行，检查最后有效行是否是被截断的不完整围栏 / Strip trailing blanks, check for truncated fence
         while lines and lines[-1] == '':
             lines.pop()
-        if lines and re.match(r' {0,3}```\S+$', lines[-1]):
+        if lines and _RE_TRAILING_FENCE.match(lines[-1]):
             # 末尾是带语言标记的未完成围栏 → 字符截断产物，直接移除避免空代码块
             # Trailing incomplete opening fence (language specifier present) → truncation artifact, remove it
             lines.pop()
@@ -438,10 +513,11 @@ def _extract_tool_result_text(c: dict, d: dict, parts: list[str]) -> None:
     # 其他 tool_result（Bash 输出等）不展示 / Skip other tool_results (Bash output etc.)
 
 
-def parse_transcript(filepath: Path) -> tuple[list[dict], str | None, str | None, str | None, list[dict]]:
+def parse_transcript(filepath: Path) -> ParseResult:
     """解析 JSONL 转录文件，提取对话内容 / Parse JSONL transcript, extract conversation content"""
     messages = []
     plan_writes: list[dict] = []
+    user_boundary_indices: list[int] = []
     session_id = None
     first_ts = None
     last_ts = None
@@ -492,12 +568,14 @@ def parse_transcript(filepath: Path) -> tuple[list[dict], str | None, str | None
                     continue
 
                 msg = {"role": "user", "text": text, "timestamp": timestamp, "_is_user_boundary": True}
+                user_boundary_indices.append(len(messages))
                 messages.append(msg)
                 last_ts = timestamp
 
             elif msg_type == "user" and timestamp:
                 # 非 external 类型的用户消息（如审批面板输入），仅作为编辑周期边界，不展示内容
                 # Non-external user messages (e.g. approval panel inputs): cycle boundaries only, not displayed
+                user_boundary_indices.append(len(messages))
                 messages.append({"_is_user_boundary": True, "timestamp": timestamp})
 
             elif msg_type == "assistant":
@@ -563,7 +641,7 @@ def parse_transcript(filepath: Path) -> tuple[list[dict], str | None, str | None
                 messages.append(msg)
                 last_ts = timestamp
 
-    return messages, session_id, first_ts, last_ts, plan_writes
+    return ParseResult(messages, session_id, first_ts, last_ts, plan_writes, user_boundary_indices)
 
 
 def extract_topic(messages: list[dict]) -> str:
@@ -572,8 +650,8 @@ def extract_topic(messages: list[dict]) -> str:
         if m.get("role") == "user":
             text = m.get("text", "")
             text = text.replace("\n", " ").strip()
-            text = re.sub(r'[#*_`~>\[\]!|\\^]', '', text).strip()
-            text = re.sub(r'[/\\:*?"<>|]', '', text)
+            text = _RE_MARKDOWN_STYLING.sub('', text).strip()
+            text = _UNSAFE_FILENAME_RE.sub('', text)
             text = _TITLE_STRIP_RE.sub('', text)
             # East Asian Width 截断：CJK/全角计 2，ASCII 计 1，累计 ≤ 40
             width = 0
@@ -616,21 +694,22 @@ def escape_obsidian_tags(text: str) -> str:
             return prefix + '\\#' + following
         return m.group(0)            # 非 tag 首字符 → 原样保留 / Not a tag start → leave unchanged
 
-    return re.sub(r'(^|\W)#(\S)', _replacer, text)
+    return _RE_OBSIDIAN_TAG.sub(_replacer, text)
 
 
 def sanitize_markdown_links(text: str) -> str:
     """去掉 Markdown 链接格式避免 Obsidian 误渲染 / Strip markdown link syntax to avoid Obsidian misrendering"""
     # [text](url) → text (url) — 纯文本保留路径 / plain text with path
-    text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', r'\1 (\2)', text)
+    text = _RE_MD_LINK.sub(r'\1 (\2)', text)
     # 独立 [text] → 去掉方括号（保留 [[wikilink]]）/ standalone [text] → remove brackets (preserve [[wikilink]])
-    text = re.sub(r'(?<!\[)\[([^\]]+)\](?!\])', r'\1', text)
+    text = _RE_BARE_MD_LINK.sub(r'\1', text)
     return text
 
 
 def build_plan_versions(plan_writes: list[dict], messages: list[dict],
                         output_subdir: Path,
-                        cwd: str | None = None) -> tuple[dict[str, list[tuple[str, str, str]]], list[str]]:
+                        cwd: str | None = None,
+                        user_boundary_indices: list[int] | None = None) -> tuple[dict[str, list[tuple[str, str, str]]], list[str]]:
     """按用户消息边界将 plan_writes 分组为编辑周期，创建版本文件，更新 .plan_mapping.json。
     返回: (timeline, final_plans)
     Group plan writes into edit cycles by user-message boundaries, create version files,
@@ -640,9 +719,12 @@ def build_plan_versions(plan_writes: list[dict], messages: list[dict],
 
     # 收集所有用户消息时间戳作为周期边界 / Collect all user message timestamps as cycle boundaries
     user_ts_list: list[str] = []
-    for m in messages:
-        if m.get("_is_user_boundary"):
-            user_ts_list.append(m["timestamp"])
+    if user_boundary_indices is not None:
+        user_ts_list = [messages[i]["timestamp"] for i in user_boundary_indices]
+    else:
+        for m in messages:
+            if m.get("_is_user_boundary"):
+                user_ts_list.append(m["timestamp"])
 
     # 按 stem 分组 / Group writes by stem
     by_stem: dict[str, list[dict]] = {}
@@ -696,18 +778,25 @@ def _has_user_boundary_between(ts1: str, ts2: str, user_ts_list: list[str]) -> b
     return idx < len(user_ts_list) and user_ts_list[idx] < ts2
 
 
-def _deduplicate_filename(directory: Path, base_name: str, skip: Path | None = None) -> str:
-    """去重文件名，同名追加 _2 _3 / Deduplicate filename by appending _2 _3"""
+def _deduplicate_filename(directory: Path, base_name: str, skip: Path | None = None,
+                         seen: set[str] | None = None) -> str:
+    """去重文件名，同名追加 _2 _3 / Deduplicate filename by appending _2 _3
+
+    seen: 已用文件名的内存集合，传入时优先在内存中检查，避免文件系统 stat 调用。
+          Memory set of used filenames; when provided, checks memory first to avoid stat syscalls."""
     filename = base_name
     counter = 2
     while True:
         candidate = directory / filename
-        if not candidate.exists() or candidate == skip:
+        exists = filename in seen if seen is not None else candidate.exists()
+        if (not exists or candidate == skip):
             break
         stem = base_name.rsplit(".", 1)[0]
         ext = f".{base_name.rsplit('.', 1)[1]}" if "." in base_name else ""
         filename = f"{stem}_{counter}{ext}"
         counter += 1
+    if seen is not None:
+        seen.add(filename)
     return filename
 
 
@@ -736,13 +825,15 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
 
     content_hash = hashlib.sha256(content.encode()).hexdigest()[:_HASH_TRUNCATE_LEN]
 
-    entry = mapping.get(stem)
-    if entry and isinstance(entry, dict):
-        for v in entry.get("versions", []):
-            if v.get("hash") == content_hash:
-                # 已存在，更新 current 指向 / Already exists, update current pointer
-                entry["current"] = v["name"]
-                return
+    # 哈希索引 O(1) 查找，避免遍历版本列表 / Hash index O(1) lookup, avoid scanning version list
+    hi = _plan_hash_index.get(str(output_subdir))
+    if hi and stem in hi and content_hash in hi[stem]:
+        existing_name = hi[stem][content_hash]
+        entry = mapping.get(stem)
+        if not entry or not isinstance(entry, dict):
+            mapping[stem] = {"current": None, "versions": []}
+        mapping[stem]["current"] = existing_name
+        return
 
     # Fallback：缓存丢失时从磁盘 plan 文件反向匹配 / Scan disk for existing plan version with same stem+hash
     plans_dir = output_subdir / "plans"
@@ -763,6 +854,8 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
                         "name": f.name, "hash": content_hash,
                         "ts": last["timestamp"], "h1": h1,
                     })
+                    # 更新哈希索引 / Update hash index
+                    _plan_hash_index.setdefault(str(output_subdir), {}).setdefault(stem, {})[content_hash] = f.name
                     return
             except OSError:
                 continue
@@ -800,6 +893,8 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
         "ts": last["timestamp"],
         "h1": h1,
     })
+    # 更新哈希索引 / Update hash index
+    _plan_hash_index.setdefault(str(output_subdir), {}).setdefault(stem, {})[content_hash] = filename
 
 
 def _finalize_plan_versions(mapping: dict, output_subdir: Path,
@@ -887,9 +982,12 @@ def _truncate_text(text: str, max_len: int) -> str:
     return _sanitize_text(text)
 
 
-def generate_markdown(messages: list[dict], session_id: str | None, first_ts: str | None, last_ts: str | None,
-                     filepath: Path, topic: str, cwd: str | None = None, label: str | None = None,
-                     final_plans: list[str] | None = None) -> str:
+def _build_frontmatter(messages: list[dict], session_id: str | None,
+                       first_ts: str | None, last_ts: str | None,
+                       filepath: Path, cwd: str | None = None,
+                       label: str | None = None,
+                       final_plans: list[str] | None = None) -> list[str]:
+    """构建会话笔记 YAML frontmatter + 元数据头 / Build YAML frontmatter + metadata header"""
     user_count = sum(1 for m in messages if m.get("role") == "user")
     assistant_count = sum(1 for m in messages if m.get("role") == "assistant")
 
@@ -915,6 +1013,14 @@ def generate_markdown(messages: list[dict], session_id: str | None, first_ts: st
     lines.append("")
     lines.append("---")
     lines.append("")
+    return lines
+
+
+def generate_markdown(messages: list[dict], session_id: str | None, first_ts: str | None, last_ts: str | None,
+                     filepath: Path, topic: str, cwd: str | None = None, label: str | None = None,
+                     final_plans: list[str] | None = None) -> str:
+    lines = _build_frontmatter(messages, session_id, first_ts, last_ts, filepath,
+                               cwd=cwd, label=label, final_plans=final_plans)
 
     round_num = 0
     pending_tools: list[str] = []  # 缓存连续纯工具调用 / Buffer for consecutive pure-tool messages
@@ -990,10 +1096,15 @@ def generate_markdown(messages: list[dict], session_id: str | None, first_ts: st
     return "\n".join(lines)
 
 
-def find_existing_output(stem: str, output_subdir: Path) -> Path | None:
-    """根据 JSONL stem 找到已存在的输出文件，不存在则返回 None / Find existing output file by JSONL stem, with disk fallback"""
-    mapping_file = _CACHE_DIR / "session_mappings" / f"{_cache_key(output_subdir)}.json"
-    mapping = _read_json_file(mapping_file, {})
+def find_existing_output(stem: str, output_subdir: Path,
+                       mapping: dict[str, str] | None = None) -> Path | None:
+    """根据 JSONL stem 找到已存在的输出文件，不存在则返回 None / Find existing output file by JSONL stem, with disk fallback
+
+    当 mapping 参数传入时使用内存 dict（--scan-all 批量模式），避免重复磁盘 I/O。
+    When mapping is provided, use in-memory dict to avoid repeated disk I/O (--scan-all batch mode)."""
+    if mapping is None:
+        mapping_file = _CACHE_DIR / "session_mappings" / f"{_cache_key(output_subdir)}.json"
+        mapping = _read_json_file(mapping_file, {})
     entry = mapping.get(stem)
     session_marker = f"> Session：`{stem}`"
 
@@ -1017,42 +1128,59 @@ def find_existing_output(stem: str, output_subdir: Path) -> Path | None:
                 head = "".join(fh.readline() for _ in range(20))
             if session_marker in head:
                 # 找到匹配文件，补登记 mapping / Found match, update mapping
-                save_mapping(stem, f.name, output_subdir)
+                mapping[stem] = f.name
                 return f
         except OSError:
             continue
     return None
 
 
-def save_mapping(stem: str, filename: str, output_subdir: Path) -> None:
-    """记录 JSONL stem → filename 的映射到本地缓存 / Save stem→filename mapping to local cache"""
+def save_mapping(stem: str, filename: str, output_subdir: Path,
+                mapping: dict[str, str] | None = None) -> None:
+    """记录 JSONL stem → filename 的映射到本地缓存 / Save stem→filename mapping to local cache
+
+    当 mapping 参数传入时仅更新内存 dict，调用方负责持久化。
+    When mapping is provided, only update in-memory dict; caller handles persistence."""
+    if mapping is not None:
+        mapping[stem] = filename
+        return
     (_CACHE_DIR / "session_mappings").mkdir(parents=True, exist_ok=True)
     mapping_file = _CACHE_DIR / "session_mappings" / f"{_cache_key(output_subdir)}.json"
-    mapping = _read_json_file(mapping_file, {})
-    mapping[stem] = filename
+    disk_mapping = _read_json_file(mapping_file, {})
+    disk_mapping[stem] = filename
+    _write_json_file(mapping_file, disk_mapping)
+
+
+def _flush_session_mapping(output_subdir: Path, mapping: dict[str, str]) -> None:
+    """持久化 session 映射到磁盘 / Persist session mapping to disk"""
+    (_CACHE_DIR / "session_mappings").mkdir(parents=True, exist_ok=True)
+    mapping_file = _CACHE_DIR / "session_mappings" / f"{_cache_key(output_subdir)}.json"
     _write_json_file(mapping_file, mapping)
 
 
-def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -> str | None:
-    """处理单个转录文件，返回生成的文件名，无变化则返回 None"""
+def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None,
+                session_mapping: dict[str, str] | None = None) -> ProcessResult | None:
+    """处理单个转录文件，返回 ProcessResult，无变化则返回 None
+    session_mapping: --scan-all 批量模式下传入内存 dict，避免重复磁盘 I/O / in-memory dict for --scan-all to skip repeated disk I/O"""
     output_subdir.mkdir(parents=True, exist_ok=True)
 
     # mtime 增量检测：先做轻量检查，避免不必要的 JSONL 解析
-    existing = find_existing_output(transcript.stem, output_subdir)
+    existing = find_existing_output(transcript.stem, output_subdir, mapping=session_mapping)
     if existing and existing.stat().st_mtime >= transcript.stat().st_mtime:
-        return None
+        return ProcessResult(filename="", is_update=False, skipped=True)
 
-    messages, session_id, first_ts, last_ts, plan_writes = parse_transcript(transcript)
-    if not messages or len(messages) < 2:
+    r = parse_transcript(transcript)
+    if not r.messages or len(r.messages) < 2:
         return None
 
     # 构建 plan 版本时间线并创建版本文件 / Build plan version timeline and create version files
-    plan_timeline, final_plans = build_plan_versions(plan_writes, messages, output_subdir, cwd)
+    plan_timeline, final_plans = build_plan_versions(r.plan_writes, r.messages, output_subdir, cwd,
+                                                    user_boundary_indices=r.user_boundary_indices)
 
     # 按消息时间戳匹配活跃 plan 版本 / Match active plan versions per message timestamp
-    resolve_plan_refs_from_timeline(messages, plan_timeline)
+    resolve_plan_refs_from_timeline(r.messages, plan_timeline)
 
-    topic = extract_topic(messages)
+    topic = extract_topic(r.messages)
 
     # 生成文件名（纯主题，同名自动加 _2 _3 去重）
     base_filename = f"{topic}.md"
@@ -1065,77 +1193,94 @@ def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None) -
         existing.unlink(missing_ok=True)
 
     # 获取 VS Code 标签（仅写入 frontmatter 元数据，不做标题）
-    label = find_session_name(session_id)
+    label = find_session_name(r.session_id)
 
-    md = generate_markdown(messages, session_id, first_ts, last_ts, transcript, topic, cwd, label,
+    md = generate_markdown(r.messages, r.session_id, r.first_ts, r.last_ts, transcript, topic, cwd, label,
                            final_plans=final_plans)
     output_path.write_text(md, encoding="utf-8")
-    save_mapping(transcript.stem, filename, output_subdir)
+    save_mapping(transcript.stem, filename, output_subdir, mapping=session_mapping)
 
     is_update = existing is not None
-    subdir_name = output_subdir.name
-    return f"[{subdir_name}] {filename} (更新)" if is_update else f"[{subdir_name}] {filename}"
+    return ProcessResult(filename=filename, is_update=is_update)
+
+
+def _run_scan_all() -> None:
+    """扫描所有项目子目录的所有 JSONL 文件 / Scan all JSONL files in all project subdirectories"""
+    processed = 0
+    total_jsonl = 0
+    used_names: set[str] = set()
+    name_to_cwd: dict[str, str] = {}  # {folder_name: cwd} / folder name → cwd mapping
+    # 批量映射：每个 output_subdir 一个内存 dict，循环结束后统一持久化 / Batch mappings: one in-memory dict per output_subdir, flushed after loop
+    batch_mappings: dict[Path, dict[str, str]] = {}
+    for subdir in sorted(TRANSCRIPTS_DIR.iterdir()):
+        if not subdir.is_dir():
+            continue
+        # 按 mtime 降序尝试提取 cwd，避免 stub 文件 / Try newest JSONLs first to avoid stub files with no cwd
+        jsonl_files = sorted(subdir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if not jsonl_files:
+            continue
+        total_jsonl += len(jsonl_files)
+        cwd = get_cwd_from_jsonl(*jsonl_files)
+        folder_name = resolve_folder_name(cwd, used_names) if cwd else subdir.name
+        output_subdir = OBSIDIAN_DIR / folder_name
+        if cwd:
+            name_to_cwd[folder_name] = cwd
+        # 为该 output_subdir 加载或复用内存 mapping / Load or reuse in-memory mapping for this output_subdir
+        sm = batch_mappings.get(output_subdir)
+        if sm is None:
+            sm = _read_json_file(
+                _CACHE_DIR / "session_mappings" / f"{_cache_key(output_subdir)}.json", {})
+            batch_mappings[output_subdir] = sm
+        for transcript in jsonl_files:
+            result = process_one(transcript, output_subdir, cwd, session_mapping=sm)
+            if result and not result.skipped:
+                tag = "(更新)" if result.is_update else ""
+                print(f"  归档: [{output_subdir.name}] {result.filename} {tag}", file=sys.stderr)
+                processed += 1
+    # 批量持久化 session mappings / Batch flush session mappings
+    for output_subdir, sm in batch_mappings.items():
+        _flush_session_mapping(output_subdir, sm)
+    # 持久化 cwd → folder_name 映射，供增量 SessionEnd 查询 / Persist cwd → folder_name mapping for SessionEnd to query
+    save_cwd_mapping(name_to_cwd)
+    print(f"扫描完成: {total_jsonl} 个会话, 新归档 {processed} 个", file=sys.stderr)
+
+
+def _run_session_end() -> None:
+    """处理最新的一个转录文件（跨所有子目录找最近修改的 JSONL）/ Process only the latest transcript"""
+    transcript = find_latest_transcript()
+    if not transcript:
+        sys.exit(0)
+    # 根据 cwd 生成新文件夹名 / Generate new folder name from cwd
+    cwd = get_cwd_from_jsonl(transcript)
+    if cwd:
+        cwd_to_name = load_cwd_mapping()  # {cwd: folder_name} / cwd → folder name lookup
+        if cwd in cwd_to_name:
+            # 已有映射，直接复用 / Already mapped, reuse
+            folder_name = cwd_to_name[cwd]
+        else:
+            # 新 cwd，需解析冲突 / New cwd, resolve against existing
+            existing_names = set(cwd_to_name.values())
+            folder_name = resolve_folder_name(cwd, existing_names)
+            # 持久化新映射 / Persist new mapping
+            name_to_cwd = {v: k for k, v in cwd_to_name.items()}
+            name_to_cwd[folder_name] = cwd
+            save_cwd_mapping(name_to_cwd)
+    else:
+        folder_name = transcript.parent.name
+    output_subdir = OBSIDIAN_DIR / folder_name
+    result = process_one(transcript, output_subdir, cwd)
+    if result and not result.skipped:
+        tag = "(更新)" if result.is_update else ""
+        print(f"Session saved to Obsidian: [{output_subdir.name}] {result.filename} {tag}", file=sys.stderr)
 
 
 def main() -> None:
-    # 确保输出根目录存在
+    """CLI 入口：根据 --scan-all 标志分发 / CLI entry: dispatch by --scan-all flag"""
     OBSIDIAN_DIR.mkdir(parents=True, exist_ok=True)
-
-    scan_all = "--scan-all" in sys.argv
-
-    if scan_all:
-        # 扫描所有项目子目录的所有 JSONL 文件 / Scan all JSONL files in all project subdirectories
-        processed = 0
-        total_jsonl = 0
-        used_names: set[str] = set()
-        name_to_cwd: dict[str, str] = {}  # {folder_name: cwd} / folder name → cwd mapping
-        for subdir in sorted(TRANSCRIPTS_DIR.iterdir()):
-            if not subdir.is_dir():
-                continue
-            # 按 mtime 降序尝试提取 cwd，避免 stub 文件 / Try newest JSONLs first to avoid stub files with no cwd
-            jsonl_files = sorted(subdir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
-            if not jsonl_files:
-                continue
-            total_jsonl += len(jsonl_files)
-            cwd = get_cwd_from_jsonl(*jsonl_files)
-            folder_name = resolve_folder_name(cwd, used_names) if cwd else subdir.name
-            output_subdir = OBSIDIAN_DIR / folder_name
-            if cwd:
-                name_to_cwd[folder_name] = cwd
-            for transcript in jsonl_files:
-                result = process_one(transcript, output_subdir, cwd)
-                if result:
-                    print(f"  归档: {result}", file=sys.stderr)
-                    processed += 1
-        # 持久化 cwd → folder_name 映射，供增量 SessionEnd 查询 / Persist cwd → folder_name mapping for SessionEnd to query
-        save_cwd_mapping(name_to_cwd)
-        print(f"扫描完成: {total_jsonl} 个会话, 新归档 {processed} 个", file=sys.stderr)
+    if "--scan-all" in sys.argv:
+        _run_scan_all()
     else:
-        # 只处理最新的一个（跨所有子目录找最近修改的 JSONL） / Process only the latest one
-        transcript = find_latest_transcript()
-        if not transcript:
-            sys.exit(0)
-        # 根据 cwd 生成新文件夹名 / Generate new folder name from cwd
-        cwd = get_cwd_from_jsonl(transcript)
-        if cwd:
-            cwd_to_name = load_cwd_mapping()  # {cwd: folder_name} / cwd → folder name lookup
-            if cwd in cwd_to_name:
-                # 已有映射，直接复用 / Already mapped, reuse
-                folder_name = cwd_to_name[cwd]
-            else:
-                # 新 cwd，需解析冲突 / New cwd, resolve against existing
-                existing_names = set(cwd_to_name.values())
-                folder_name = resolve_folder_name(cwd, existing_names)
-                # 持久化新映射 / Persist new mapping
-                name_to_cwd = {v: k for k, v in cwd_to_name.items()}
-                name_to_cwd[folder_name] = cwd
-                save_cwd_mapping(name_to_cwd)
-        else:
-            folder_name = transcript.parent.name
-        output_subdir = OBSIDIAN_DIR / folder_name
-        result = process_one(transcript, output_subdir, cwd)
-        if result:
-            print(f"Session saved to Obsidian: {result}", file=sys.stderr)
+        _run_session_end()
 
 
 if __name__ == "__main__":
