@@ -122,8 +122,10 @@ check("#tag 被转义", "\\#tag1" in output)
 
 # ===== Plan 版本管理 =====
 print("\n=== Plan 版本管理 ===")
-plan_mapping_file = plans_dir / "plan_mapping.json" if plans_dir else None
-check("plan_mapping.json 存在", plan_mapping_file and plan_mapping_file.exists())
+# plan_mapping 已移到本地缓存目录 / plan_mapping moved to local cache directory
+plan_cache_dir = Path.home() / ".claude" / "claude_to_obsidian" / "plan_mappings"
+plan_mapping_file = plan_cache_dir / "project.json"
+check("plan_mapping.json 存在（本地缓存）", plan_mapping_file.exists())
 draft_dir = plans_dir / "draft_plans" if plans_dir else None
 
 if plan_mapping_file and plan_mapping_file.exists():

@@ -26,8 +26,11 @@ TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", Path.home() / ".claude"
 DISPLAY_TZ = timezone(timedelta(hours=8))
 PLANS_SOURCE_DIR = Path.home() / ".claude" / "plans"
 _CACHE_DIR = Path.home() / ".claude" / "claude_to_obsidian"
-_CWD_MAPPING_FILE = _CACHE_DIR / "cwd_mapping.json"
-_VSCODE_LABEL_CACHE = _CACHE_DIR / ".vscode_labels_cache.json"
+
+
+def _cache_key(output_subdir: Path) -> str:
+    """用 output_subdir 的 folder_name 作为缓存键（resolve_folder_name 已保证唯一） / Use folder_name as cache key (guaranteed unique by resolve_folder_name)"""
+    return output_subdir.name
 
 # 截断与限制常量 / Truncation and limit constants
 _MAX_CWD_SCAN_LINES = 100
@@ -111,14 +114,14 @@ def _write_json_file(filepath: Path, data) -> None:
 def load_cwd_mapping() -> dict[str, str]:
     """读取 cwd → folder_name 映射 / Load cwd → folder_name mapping"""
     # 文件存储为 {folder_name: cwd}，反转为 {cwd: folder_name} 便于查询 / File stores {folder_name: cwd}, invert for O(1) lookup
-    raw = _read_json_file(_CWD_MAPPING_FILE, {})
+    raw = _read_json_file(_CACHE_DIR / "cwd_mapping.json", {})
     return {cwd: name for name, cwd in raw.items()}
 
 
 def save_cwd_mapping(name_to_cwd: dict[str, str]) -> None:
     """全量写入 {folder_name: cwd} 映射 / Full rewrite of folder_name → cwd mapping"""
-    _CWD_MAPPING_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _write_json_file(_CWD_MAPPING_FILE, name_to_cwd)
+    (_CACHE_DIR / "cwd_mapping.json").parent.mkdir(parents=True, exist_ok=True)
+    _write_json_file(_CACHE_DIR / "cwd_mapping.json", name_to_cwd)
 
 
 # 文件名不安全字符（跨平台交集） / Filesystem-unsafe characters (cross-platform intersection)
@@ -192,20 +195,20 @@ def format_timestamp_for_filename(ts_str: str) -> str:
 
 
 def load_plan_mapping(output_subdir: Path) -> dict[str, dict]:
-    """加载项目 plan 映射文件 / Load per-project plan mapping {stem: {current, versions}}"""
+    """加载项目 plan 映射缓存（本地缓存目录，不参与 Obsidian 同步） / Load per-project plan mapping from local cache"""
     cache_key = str(output_subdir)
     if cache_key in _plan_mapping_cache:
         return _plan_mapping_cache[cache_key]
-    mapping = _read_json_file(output_subdir / "plans" / "plan_mapping.json", {})
+    (_CACHE_DIR / "plan_mappings").mkdir(parents=True, exist_ok=True)
+    mapping = _read_json_file(_CACHE_DIR / "plan_mappings" / f"{_cache_key(output_subdir)}.json", {})
     _plan_mapping_cache[cache_key] = mapping
     return mapping
 
 
 def save_plan_mapping(output_subdir: Path, mapping: dict) -> None:
-    """持久化项目 plan 映射 / Persist per-project plan mapping"""
-    plans_dir = output_subdir / "plans"
-    plans_dir.mkdir(parents=True, exist_ok=True)
-    _write_json_file(plans_dir / "plan_mapping.json", mapping)
+    """持久化项目 plan 映射到本地缓存 / Persist per-project plan mapping to local cache"""
+    (_CACHE_DIR / "plan_mappings").mkdir(parents=True, exist_ok=True)
+    _write_json_file(_CACHE_DIR / "plan_mappings" / f"{_cache_key(output_subdir)}.json", mapping)
     # 写入成功后更新缓存 / Update cache only after successful write
     _plan_mapping_cache[str(output_subdir)] = mapping
 
@@ -245,7 +248,8 @@ def _scan_workspace_labels(ws_dir: Path, labels: dict[str, str]) -> None:
 
 def _load_vscode_labels() -> dict[str, str]:
     """从磁盘缓存加载 VS Code 标签索引，仅增量扫描新 workspace / Load label index from disk cache, incrementally scan new workspaces only"""
-    cache = _read_json_file(_VSCODE_LABEL_CACHE, {})
+    vscode_cache = _CACHE_DIR / "vscode_labels_cache.json"
+    cache = _read_json_file(vscode_cache, {})
     labels: dict[str, str] = cache.get("labels", {}) if isinstance(cache, dict) else {}
     indexed_dirs: set[str] = set(cache.get("indexed_dirs", [])) if isinstance(cache, dict) else set()
 
@@ -267,10 +271,10 @@ def _load_vscode_labels() -> dict[str, str]:
         # 写回磁盘 / Write back to disk
         cache_data = {"labels": labels, "indexed_dirs": sorted(current_dirs)}
         try:
-            _VSCODE_LABEL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = _VSCODE_LABEL_CACHE.with_suffix(_VSCODE_LABEL_CACHE.suffix + ".tmp")
+            vscode_cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = vscode_cache.with_suffix(vscode_cache.suffix + ".tmp")
             tmp.write_text(json.dumps(cache_data, ensure_ascii=False, indent=2))
-            os.replace(tmp, _VSCODE_LABEL_CACHE)
+            os.replace(tmp, vscode_cache)
         except OSError:
             pass  # 写入失败不影响主流程 / write failure is non-fatal
 
@@ -740,6 +744,29 @@ def _save_cycle(stem: str, cycle_writes: list[dict], output_subdir: Path,
                 entry["current"] = v["name"]
                 return
 
+    # Fallback：缓存丢失时从磁盘 plan 文件反向匹配 / Scan disk for existing plan version with same stem+hash
+    plans_dir = output_subdir / "plans"
+    if plans_dir.exists():
+        ref_marker = f"ref_plan_file: {stem}.md"
+        for f in plans_dir.glob("*.md"):
+            try:
+                text = f.read_text(encoding="utf-8")
+                if ref_marker not in text:
+                    continue
+                file_hash = hashlib.sha256(text.encode()).hexdigest()[:_HASH_TRUNCATE_LEN]
+                if file_hash == content_hash:
+                    # 找到相同内容的已有版本，复用 / Found existing version, reuse it
+                    if stem not in mapping or not isinstance(mapping.get(stem), dict):
+                        mapping[stem] = {"current": None, "versions": []}
+                    mapping[stem]["current"] = f.name
+                    mapping[stem]["versions"].append({
+                        "name": f.name, "hash": content_hash,
+                        "ts": last["timestamp"], "h1": h1,
+                    })
+                    return
+            except OSError:
+                continue
+
     ts_compact = format_timestamp_for_filename(last["timestamp"])
     friendly_name = sanitize_plan_filename(h1)
     if len(friendly_name) > _PLAN_FILENAME_MAX_LEN:
@@ -965,15 +992,25 @@ def generate_markdown(messages: list[dict], session_id: str | None, first_ts: st
 
 def find_existing_output(stem: str, output_subdir: Path) -> Path | None:
     """根据 JSONL stem 找到已存在的输出文件，不存在则返回 None / Find existing output file by JSONL stem, with disk fallback"""
-    mapping = _read_json_file(output_subdir / "session_mapping.json", {})
+    mapping_file = _CACHE_DIR / "session_mappings" / f"{_cache_key(output_subdir)}.json"
+    mapping = _read_json_file(mapping_file, {})
     entry = mapping.get(stem)
+    session_marker = f"> Session：`{stem}`"
+
     if entry is not None and isinstance(entry, str):
         p = output_subdir / entry
         if p.exists():
-            return p
+            # 验证文件确实属于该 stem，防止 mapping 过期指针 / Verify file belongs to this stem
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    head = "".join(fh.readline() for _ in range(20))
+                if session_marker in head:
+                    return p
+                # 不匹配：mapping 过期，fall through 到磁盘扫描 / Mismatch: stale mapping, fall through
+            except OSError:
+                pass
 
     # Fallback：mapping 丢失时从磁盘 .md 文件反向匹配 session ID / Scan .md files for matching session ID
-    session_marker = f"> Session：`{stem}`"
     for f in output_subdir.glob("*.md"):
         try:
             with open(f, encoding="utf-8") as fh:
@@ -988,8 +1025,9 @@ def find_existing_output(stem: str, output_subdir: Path) -> Path | None:
 
 
 def save_mapping(stem: str, filename: str, output_subdir: Path) -> None:
-    """记录 JSONL stem → filename 的映射（每个项目子目录独立维护）"""
-    mapping_file = output_subdir / "session_mapping.json"
+    """记录 JSONL stem → filename 的映射到本地缓存 / Save stem→filename mapping to local cache"""
+    (_CACHE_DIR / "session_mappings").mkdir(parents=True, exist_ok=True)
+    mapping_file = _CACHE_DIR / "session_mappings" / f"{_cache_key(output_subdir)}.json"
     mapping = _read_json_file(mapping_file, {})
     mapping[stem] = filename
     _write_json_file(mapping_file, mapping)
