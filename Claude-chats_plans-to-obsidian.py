@@ -41,7 +41,7 @@ class ProcessResult:
 
 
 # ===== 配置 =====
-OBSIDIAN_DIR = Path(os.environ.get("OBSIDIAN_DIR", Path.home() / "Obsidian" / "Project" / "claude" / "session"))
+OBSIDIAN_DIR = Path(os.environ.get("OBSIDIAN_DIR", Path.home() / "AiDocs" / "session"))
 TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", Path.home() / ".claude" / "projects"))
 
 DISPLAY_TZ = timezone(timedelta(hours=int(os.environ.get("DISPLAY_TZ_OFFSET", "8"))))
