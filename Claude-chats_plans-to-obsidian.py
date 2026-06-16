@@ -1096,6 +1096,23 @@ def generate_markdown(messages: list[dict], session_id: str | None, first_ts: st
     return "\n".join(lines)
 
 
+def _read_file_head(filepath: Path, extra_lines: int = 5) -> str:
+    """读取文件头部：frontmatter（到第二个 ---） + extra_lines 行，用于 session marker 匹配 / Read file head: frontmatter + extra_lines for session marker matching"""
+    lines: list[str] = []
+    dashes = 0
+    with open(filepath, encoding="utf-8") as fh:
+        for line in fh:
+            lines.append(line)
+            if line.strip() == "---":
+                dashes += 1
+                if dashes >= 2:
+                    lines.extend(fh.readline() for _ in range(extra_lines))
+                    break
+            if len(lines) >= 50:  # 安全上限，避免无 frontmatter 的文件读全文
+                break
+    return "".join(lines)
+
+
 def find_existing_output(stem: str, output_subdir: Path,
                        mapping: dict[str, str] | None = None) -> Path | None:
     """根据 JSONL stem 找到已存在的输出文件，不存在则返回 None / Find existing output file by JSONL stem, with disk fallback
@@ -1113,8 +1130,7 @@ def find_existing_output(stem: str, output_subdir: Path,
         if p.exists():
             # 验证文件确实属于该 stem，防止 mapping 过期指针 / Verify file belongs to this stem
             try:
-                with open(p, encoding="utf-8") as fh:
-                    head = "".join(fh.readline() for _ in range(20))
+                head = _read_file_head(p)
                 if session_marker in head:
                     return p
                 # 不匹配：mapping 过期，fall through 到磁盘扫描 / Mismatch: stale mapping, fall through
@@ -1124,8 +1140,7 @@ def find_existing_output(stem: str, output_subdir: Path,
     # Fallback：mapping 丢失时从磁盘 .md 文件反向匹配 session ID / Scan .md files for matching session ID
     for f in output_subdir.glob("*.md"):
         try:
-            with open(f, encoding="utf-8") as fh:
-                head = "".join(fh.readline() for _ in range(20))
+            head = _read_file_head(f)
             if session_marker in head:
                 # 找到匹配文件，补登记 mapping / Found match, update mapping
                 mapping[stem] = f.name
@@ -1188,7 +1203,7 @@ def process_one(transcript: Path, output_subdir: Path, cwd: str | None = None,
 
     output_path = output_subdir / filename
 
-    # 如果旧文件还在且文件名不同，删掉旧的
+    # 如果旧文件还在且文件名不同，删掉旧的 / Remove old file if renamed
     if existing and existing != output_path:
         existing.unlink(missing_ok=True)
 
